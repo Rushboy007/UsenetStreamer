@@ -365,12 +365,11 @@ class BackgroundTriageSession {
         }
 
         // --- Phase 3: No verified yet — queue retries for next batch, auto-expand ---
-        // Only queue retries if indexers are still partially responsive
-        if (consecutiveFailedBatches === 0) {
-          retryQueue.push(...batchRetries);
-          if (batchRetries.length > 0) {
-            console.log(`[BG-TRIAGE] ${batchRetries.length} transient failures queued for retry in next batch`);
-          }
+        // Always queue transient retries so each NZB gets exactly one retry attempt.
+        // The consecutiveFailedBatches >= MAX check above already aborts when indexers are truly down.
+        retryQueue.push(...batchRetries);
+        if (batchRetries.length > 0) {
+          console.log(`[BG-TRIAGE] ${batchRetries.length} transient failures queued for retry in next batch`);
         }
 
         // Small delay before trying the next batch
