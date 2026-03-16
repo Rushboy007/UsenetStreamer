@@ -14,7 +14,7 @@ const RETRYABLE_CODES = new Set(['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'ENO
 let TMDB_ENABLED = false;
 let TMDB_API_KEY = '';
 let TMDB_SEARCH_LANGUAGES = []; // Array of additional locale codes like ['hi-IN', 'ta-IN']
-let TMDB_SEARCH_MODE = 'english_only'; // 'english_only' | 'english_and_regional' | 'regional_only'
+let TMDB_SEARCH_MODE = 'english_and_regional'; // 'english_only' | 'english_and_regional' | 'regional_only'
 
 // In-memory cache for TMDb responses
 const tmdbCache = new Map();
@@ -77,11 +77,11 @@ function reloadConfig() {
   TMDB_API_KEY = (process.env.TMDB_API_KEY || '').trim();
   const languagesStr = (process.env.TMDB_SEARCH_LANGUAGES || '').trim();
   TMDB_SEARCH_LANGUAGES = languagesStr ? languagesStr.split(',').map(l => l.trim()).filter(Boolean) : [];
-  const modeRaw = (process.env.TMDB_SEARCH_MODE || 'english_only').toString().trim().toLowerCase();
+  const modeRaw = (process.env.TMDB_SEARCH_MODE || 'english_and_regional').toString().trim().toLowerCase();
   if (['english_only', 'english_and_regional', 'regional_only'].includes(modeRaw)) {
     TMDB_SEARCH_MODE = modeRaw;
   } else {
-    TMDB_SEARCH_MODE = 'english_only';
+    TMDB_SEARCH_MODE = 'english_and_regional';
   }
   
   console.log('[TMDB] Config reloaded', { 
@@ -212,8 +212,8 @@ async function tmdbRequest(endpoint, params = {}) {
 /**
  * Find TMDb ID and basic info from external ID (IMDb)
  */
-async function findByExternalId(externalId, externalSource = 'imdb_id') {
-  const cacheKey = getCacheKey('find', externalId, null);
+async function findByExternalId(externalId, externalSource = 'imdb_id', preferredMediaType = null) {
+  const cacheKey = getCacheKey('find', externalId, preferredMediaType);
   const cached = getFromCache(cacheKey);
   if (cached !== null) {
     return cached;
@@ -229,19 +229,27 @@ async function findByExternalId(externalId, externalSource = 'imdb_id') {
       return null;
     }
 
-    // Check movie_results first, then tv_results
+    // Prefer the result type matching the caller's hint
     const movieResult = data.movie_results?.[0];
     const tvResult = data.tv_results?.[0];
-    const result = movieResult || tvResult;
+    let result;
+    if (preferredMediaType === 'tv' && tvResult) {
+      result = tvResult;
+    } else if (preferredMediaType === 'movie' && movieResult) {
+      result = movieResult;
+    } else {
+      result = movieResult || tvResult;
+    }
 
     if (!result) {
       setInCache(cacheKey, null);
       return null;
     }
 
+    const isMovie = result === movieResult;
     const parsed = {
       tmdbId: result.id,
-      mediaType: movieResult ? 'movie' : 'tv',
+      mediaType: isMovie ? 'movie' : 'tv',
       title: result.title || result.name,
       originalTitle: result.original_title || result.original_name,
       originalLanguage: result.original_language,
@@ -374,7 +382,8 @@ async function getMetadataAndTitles({ imdbId, tmdbId, type }) {
 
   if (usingImdb && !resolvedTmdbId) {
     // Step 1: Find TMDb ID from IMDb ID
-    const findResult = await findByExternalId(imdbId, 'imdb_id');
+    const preferredMediaType = type === 'series' ? 'tv' : type === 'movie' ? 'movie' : null;
+    const findResult = await findByExternalId(imdbId, 'imdb_id', preferredMediaType);
     if (!findResult) {
       console.log(`[TMDB] No TMDb match found for ${imdbId}`);
       return null;
@@ -521,7 +530,8 @@ async function getLocalizedTitle({ imdbId, type, englishTitle, preferredLanguage
   console.log(`[TMDB] Looking up localized title for ${imdbId}`);
 
   // Step 1: Find TMDb ID from IMDb ID
-  const findResult = await findByExternalId(imdbId, 'imdb_id');
+  const preferredMediaType = type === 'series' ? 'tv' : type === 'movie' ? 'movie' : null;
+  const findResult = await findByExternalId(imdbId, 'imdb_id', preferredMediaType);
   if (!findResult) {
     console.log(`[TMDB] No TMDb match found for ${imdbId}`);
     return null;

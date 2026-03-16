@@ -128,6 +128,54 @@ function matchesStrict(title, strictPhrase) {
   return true;
 }
 
+// --- Levenshtein-based title similarity (catches false positives like "The Kingdom" vs "The Last Kingdom") ---
+
+const TITLE_SIMILARITY_THRESHOLD = 0.85;
+
+function normaliseTitle(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g, 'and')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\p{L}\p{N}]/gu, '')
+    .toLowerCase();
+}
+
+function levenshteinDistance(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = new Array(n + 1);
+  let curr = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+function levenshteinRatio(a, b) {
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+  return 1 - levenshteinDistance(a, b) / maxLen;
+}
+
+function titleSimilarityCheck(candidateParsedTitle, queryParsedTitle) {
+  if (!candidateParsedTitle || !queryParsedTitle) return true;
+  const normCandidate = normaliseTitle(candidateParsedTitle);
+  const normQuery = normaliseTitle(queryParsedTitle);
+  if (!normCandidate || !normQuery) return true;
+  if (normCandidate === normQuery) return true;
+  return levenshteinRatio(normCandidate, normQuery) >= TITLE_SIMILARITY_THRESHOLD;
+}
+
 function parseDurationSeconds(raw) {
   if (raw === null || raw === undefined) return null;
   if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return Math.floor(raw);
@@ -401,20 +449,62 @@ function filterAndMap(jsonData, options) {
         return;
       }
 
+      // Additional Levenshtein similarity check on parsed titles to reject false positives
+      const queryTitle = queryMeta?.title || null;
+      if (!titleSimilarityCheck(parsedCandidateTitle, queryTitle)) {
+        if (debugEnabled) {
+          console.log('[EASYNEWS] Strict match failed (title similarity too low)', {
+            title,
+            parsedTitle: parsedCandidateTitle,
+            query: queryTitle,
+            ratio: levenshteinRatio(normaliseTitle(parsedCandidateTitle), normaliseTitle(queryTitle)).toFixed(3),
+            threshold: TITLE_SIMILARITY_THRESHOLD,
+          });
+        }
+        return;
+      }
+
       const parsedYear = parsedRelease?.year ? Number(parsedRelease.year) : null;
       const parsedSeason = Array.isArray(parsedRelease?.seasons) ? parsedRelease.seasons[0] : null;
       const parsedEpisode = Array.isArray(parsedRelease?.episodes) ? parsedRelease.episodes[0] : null;
 
-      if (queryMeta?.year && parsedYear && queryMeta.year !== parsedYear) {
-        if (debugEnabled) {
-          console.log('[EASYNEWS] Strict match failed (year mismatch)', {
-            title,
-            parsedTitle: parsedCandidateTitle,
-            year: parsedYear,
-            expectedYear: queryMeta.year,
-          });
+      const isSeries = Boolean(queryMeta?.season);
+      if (queryMeta?.year && isSeries) {
+        // Series: only reject if the NZB has a year AND it mismatches (±1 tolerance)
+        if (parsedYear && Math.abs(queryMeta.year - parsedYear) > 1) {
+          if (debugEnabled) {
+            console.log('[EASYNEWS] Strict match failed (series year mismatch)', {
+              title,
+              parsedTitle: parsedCandidateTitle,
+              year: parsedYear,
+              expectedYear: queryMeta.year,
+            });
+          }
+          return;
         }
-        return;
+      } else if (queryMeta?.year) {
+        // Movie: strict year match required
+        if (!parsedYear) {
+          if (debugEnabled) {
+            console.log('[EASYNEWS] Strict match failed (missing year)', {
+              title,
+              parsedTitle: parsedCandidateTitle,
+              expectedYear: queryMeta.year,
+            });
+          }
+          return;
+        }
+        if (Math.abs(queryMeta.year - parsedYear) > 1) {
+          if (debugEnabled) {
+            console.log('[EASYNEWS] Strict match failed (year mismatch)', {
+              title,
+              parsedTitle: parsedCandidateTitle,
+              year: parsedYear,
+              expectedYear: queryMeta.year,
+            });
+          }
+          return;
+        }
       }
       if (queryMeta?.season && parsedSeason && queryMeta.season !== parsedSeason) {
         if (debugEnabled) {

@@ -10,6 +10,7 @@ process.on('unhandledRejection', (reason) => {
   console.error('[FATAL] Unhandled promise rejection (process kept alive):', reason?.message || reason);
 });
 
+const crypto = require('crypto');
 const express = require('express');
 const axios = require('axios');
 const FormData = require('form-data');
@@ -51,6 +52,7 @@ const nzbdavService = require('./src/services/nzbdav');
 const specialMetadata = require('./src/services/specialMetadata');
 const tmdbService = require('./src/services/tmdb');
 const tvdbService = require('./src/services/tvdb');
+const animeDatabase = require('./src/services/animeDatabase');
 const autoAdvanceQueue = require('./src/services/autoAdvanceQueue');
 const backgroundTriage = require('./src/services/backgroundTriage');
 const diskNzbCache = require('./src/cache/diskNzbCache');
@@ -1249,14 +1251,67 @@ const CINEMETA_URL = 'https://v3-cinemeta.strem.io/meta';
 const pipelineAsync = promisify(pipeline);
 const posixPath = path.posix;
 
-// Base64url helpers for clean stream URLs (no query params)
-function encodeStreamParams(params) {
-  const json = JSON.stringify(Object.fromEntries(params.entries()));
-  return Buffer.from(json, 'utf8').toString('base64url');
+// ---------------------------------------------------------------------------
+// AES-256-GCM encryption for stream URL parameters
+// Prevents stream-token holders from extracting embedded API keys / credentials.
+// The key is auto-generated on first use and persisted in runtime-env.json.
+// ---------------------------------------------------------------------------
+const STREAM_PARAMS_ALGO = 'aes-256-gcm';
+const STREAM_PARAMS_KEY_ENV = 'STREAM_PARAMS_ENCRYPTION_KEY';
+let _streamParamsKey = null;
+
+function getStreamParamsKey() {
+  if (_streamParamsKey) return _streamParamsKey;
+  const hexKey = (process.env[STREAM_PARAMS_KEY_ENV] || '').trim();
+  if (hexKey && /^[0-9a-f]{64}$/i.test(hexKey)) {
+    _streamParamsKey = Buffer.from(hexKey, 'hex');
+    return _streamParamsKey;
+  }
+  // Generate a new random 256-bit key and persist it
+  const newKey = crypto.randomBytes(32);
+  runtimeEnv.updateRuntimeEnv({ [STREAM_PARAMS_KEY_ENV]: newKey.toString('hex') });
+  runtimeEnv.applyRuntimeEnv();
+  _streamParamsKey = newKey;
+  console.log('[SECURITY] Generated new stream-params encryption key');
+  return _streamParamsKey;
 }
 
+/**
+ * Encrypt stream parameters so embedded download URLs / API keys are opaque.
+ * Format: "e1.{iv_hex}.{ciphertext+authTag_base64url}"
+ */
+function encodeStreamParams(params) {
+  const json = JSON.stringify(Object.fromEntries(params.entries()));
+  const key = getStreamParamsKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(STREAM_PARAMS_ALGO, key, iv);
+  const encrypted = Buffer.concat([cipher.update(json, 'utf8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  const payload = Buffer.concat([encrypted, authTag]).toString('base64url');
+  return `e1.${iv.toString('hex')}.${payload}`;
+}
+
+/**
+ * Decrypt stream parameters. Falls back to legacy base64url for backward
+ * compatibility with URLs cached before encryption was enabled.
+ */
 function decodeStreamParams(encoded) {
   try {
+    if (encoded.startsWith('e1.')) {
+      const parts = encoded.split('.');
+      if (parts.length !== 3) return null;
+      const iv = Buffer.from(parts[1], 'hex');
+      const combined = Buffer.from(parts[2], 'base64url');
+      if (combined.length < 16) return null;
+      const authTag = combined.subarray(combined.length - 16);
+      const ciphertext = combined.subarray(0, combined.length - 16);
+      const key = getStreamParamsKey();
+      const decipher = crypto.createDecipheriv(STREAM_PARAMS_ALGO, key, iv);
+      decipher.setAuthTag(authTag);
+      const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+      return JSON.parse(decrypted.toString('utf8'));
+    }
+    // Legacy fallback: plain base64url (pre-encryption URLs)
     const json = Buffer.from(encoded, 'base64url').toString('utf8');
     return JSON.parse(json);
   } catch (_) {
@@ -1360,6 +1415,61 @@ function matchesStrictSearch(title, strictPhrase) {
   return true;
 }
 
+// --- Levenshtein-based title similarity (catches false positives like "The Kingdom" vs "The Last Kingdom") ---
+
+const TITLE_SIMILARITY_THRESHOLD = 0.85;
+
+function normaliseTitle(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g, 'and')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')   // strip diacritics
+    .replace(/[^\p{L}\p{N}]/gu, '')   // strip ALL non-alphanumeric (spaces, punctuation, articles collapse together)
+    .toLowerCase();
+}
+
+function levenshteinDistance(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+
+  // Single-row DP
+  let prev = new Array(n + 1);
+  let curr = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(
+        prev[j] + 1,      // deletion
+        curr[j - 1] + 1,  // insertion
+        prev[j - 1] + cost // substitution
+      );
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+function levenshteinRatio(a, b) {
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+  return 1 - levenshteinDistance(a, b) / maxLen;
+}
+
+function titleSimilarityCheck(candidateParsedTitle, queryParsedTitle) {
+  if (!candidateParsedTitle || !queryParsedTitle) return true; // skip if either missing
+  const normCandidate = normaliseTitle(candidateParsedTitle);
+  const normQuery = normaliseTitle(queryParsedTitle);
+  if (!normCandidate || !normQuery) return true;
+  if (normCandidate === normQuery) return true;
+  return levenshteinRatio(normCandidate, normQuery) >= TITLE_SIMILARITY_THRESHOLD;
+}
+
 function ensureAddonConfigured() {
   if (!ADDON_BASE_URL) {
     throw new Error('ADDON_BASE_URL is not configured');
@@ -1376,7 +1486,7 @@ function manifestHandler(req, res) {
 
   const catalogs = [];
   const resources = ['stream'];
-  const idPrefixes = ['tt', 'tvdb', 'tmdb', 'pt', specialMetadata.SPECIAL_ID_PREFIX];
+  const idPrefixes = ['tt', 'tvdb', 'tmdb', 'kitsu', 'mal', 'anilist', 'pt', specialMetadata.SPECIAL_ID_PREFIX];
   if (STREAMING_MODE !== 'native' && NZBDAV_HISTORY_CATALOG_LIMIT > 0) {
     const catalogName = ADDON_NAME || DEFAULT_ADDON_NAME;
     catalogs.push(
@@ -1510,7 +1620,7 @@ async function streamHandler(req, res) {
   const addonBaseUrl = ADDON_BASE_URL.replace(/\/$/, '');
 
   let baseIdentifier = id;
-  if (type === 'series' && typeof id === 'string') {
+  if (type === 'series' && typeof id === 'string' && !animeDatabase.isAnimeId(id)) {
     const parts = id.split(':');
     if (parts.length >= 3) {
       const potentialEpisode = Number.parseInt(parts[parts.length - 1], 10);
@@ -1519,6 +1629,10 @@ async function streamHandler(req, res) {
         baseIdentifier = parts.slice(0, parts.length - 2).join(':');
       }
     }
+  } else if (type === 'series' && typeof id === 'string' && animeDatabase.isAnimeId(id)) {
+    // For anime IDs like kitsu:12345:5, strip only the episode part
+    const parts = id.split(':');
+    baseIdentifier = parts.slice(0, 2).join(':'); // e.g. kitsu:12345
   }
 
   let incomingImdbId = null;
@@ -1526,6 +1640,7 @@ async function streamHandler(req, res) {
   let incomingSpecialId = null;
   let incomingTmdbId = null;
   let incomingNzbdavId = null;
+  let incomingAnimeId = null; // { idType, id, episode }
 
   if (/^tt\d+$/i.test(baseIdentifier)) {
     incomingImdbId = baseIdentifier.startsWith('tt') ? baseIdentifier : `tt${baseIdentifier}`;
@@ -1541,6 +1656,12 @@ async function streamHandler(req, res) {
     if (tvdbMatch) {
       incomingTvdbId = tvdbMatch[1];
       baseIdentifier = `tvdb:${incomingTvdbId}`;
+    }
+  } else if (animeDatabase.isAnimeId(baseIdentifier)) {
+    // Anime ID detected (kitsu:, mal:, anilist:)
+    incomingAnimeId = animeDatabase.parseAnimeId(id);
+    if (incomingAnimeId) {
+      console.log(`[ANIME] Detected anime ID: ${incomingAnimeId.idType}:${incomingAnimeId.id}`, { episode: incomingAnimeId.episode });
     }
   } else {
     const lowerIdentifier = baseIdentifier.toLowerCase();
@@ -1566,7 +1687,8 @@ async function streamHandler(req, res) {
 
   const isSpecialRequest = Boolean(incomingSpecialId);
   const isNzbdavRequest = Boolean(incomingNzbdavId);
-  const requestLacksIdentifiers = !incomingImdbId && !incomingTvdbId && !incomingTmdbId && !isSpecialRequest && !isNzbdavRequest;
+  const isAnimeRequest = Boolean(incomingAnimeId);
+  const requestLacksIdentifiers = !incomingImdbId && !incomingTvdbId && !incomingTmdbId && !isSpecialRequest && !isNzbdavRequest && !isAnimeRequest;
 
   if (requestLacksIdentifiers && !isSpecialRequest) {
     res.status(400).json({ error: `Unsupported ID prefix for indexer manager search: ${baseIdentifier}` });
@@ -1604,7 +1726,7 @@ async function streamHandler(req, res) {
     }
 
     if (type === 'movie' && !incomingTmdbId && incomingImdbId && tmdbService.isConfigured()) {
-      const tmdbFind = await tmdbService.findByExternalId(incomingImdbId, 'imdb_id');
+      const tmdbFind = await tmdbService.findByExternalId(incomingImdbId, 'imdb_id', 'movie');
       if (tmdbFind?.tmdbId && tmdbFind.mediaType === 'movie') {
         incomingTmdbId = String(tmdbFind.tmdbId);
       }
@@ -1621,6 +1743,30 @@ async function streamHandler(req, res) {
         if (tvdbLookup?.tvdbId) {
           incomingTvdbId = tvdbLookup.tvdbId;
         }
+      }
+    }
+
+    // --- Anime ID resolution: map kitsu/mal/anilist → IMDB/TVDB + override season/episode ---
+    let animeResolved = null;
+    if (isAnimeRequest) {
+      try {
+        animeResolved = await animeDatabase.resolveAnimeId(incomingAnimeId);
+        if (animeResolved) {
+          if (animeResolved.imdbId && !incomingImdbId) {
+            incomingImdbId = animeResolved.imdbId;
+          }
+          if (animeResolved.tvdbId && !incomingTvdbId) {
+            incomingTvdbId = animeResolved.tvdbId;
+          }
+          if (animeResolved.tmdbId && !incomingTmdbId) {
+            incomingTmdbId = animeResolved.tmdbId;
+          }
+          console.log(`[ANIME] Resolved to Western IDs`, { imdb: incomingImdbId, tvdb: incomingTvdbId, tmdb: incomingTmdbId });
+        } else {
+          console.warn(`[ANIME] Could not resolve ${incomingAnimeId.idType}:${incomingAnimeId.id} to any Western ID`);
+        }
+      } catch (err) {
+        console.error(`[ANIME] Resolution failed: ${err.message}`);
       }
     }
 
@@ -1673,7 +1819,22 @@ async function streamHandler(req, res) {
       return;
     }
 
-    const requestedEpisode = parseRequestedEpisode(type, id, req.query || {});
+    let requestedEpisode = isAnimeRequest ? null : parseRequestedEpisode(type, id, req.query || {});
+
+    // For anime IDs, derive season/episode from anime database resolution
+    if (isAnimeRequest && animeResolved) {
+      const animeSeason = animeResolved.season != null ? Number(animeResolved.season) : 1;
+      const animeEpisode = animeResolved.episode != null ? Number(animeResolved.episode) : null;
+      if (Number.isFinite(animeEpisode)) {
+        requestedEpisode = { season: animeSeason, episode: animeEpisode };
+        console.log(`[ANIME] Resolved episode info`, { season: animeSeason, episode: animeEpisode });
+      }
+    } else if (isAnimeRequest && incomingAnimeId?.episode != null) {
+      // Fallback: use raw anime episode if database resolution failed
+      requestedEpisode = { season: 1, episode: Number(incomingAnimeId.episode) };
+      console.log(`[ANIME] Using raw anime episode (no DB mapping)`, requestedEpisode);
+    }
+
     const streamCacheKey = STREAM_CACHE_MAX_ENTRIES > 0
       ? buildStreamCacheKey({ type, id, requestedEpisode, query: req.query || {} })
       : null;
@@ -1796,6 +1957,10 @@ async function streamHandler(req, res) {
     }
     if (incomingTvdbId) {
       metaSources.push({ ids: { tvdb: incomingTvdbId }, tvdb_id: incomingTvdbId });
+    }
+    // For anime requests, push anime metadata so title resolution picks it up
+    if (isAnimeRequest && animeResolved && animeResolved.originalTitle) {
+      metaSources.push({ title: animeResolved.originalTitle, name: animeResolved.originalTitle, year: animeResolved.year });
     }
     let specialMetadataResult = null;
     if (isSpecialRequest) {
@@ -2111,10 +2276,18 @@ async function streamHandler(req, res) {
             }
           }
           // Create a metadata object compatible with existing code
+          // In english_only mode, prefer the English title over the original foreign-language title
+          const tmdbDisplayTitle = (() => {
+            if (tmdbConfig.searchMode === 'english_only' && tmdbMetadata.titles?.length > 0) {
+              const englishEntry = tmdbMetadata.titles.find(t => t.language && t.language.startsWith('en'));
+              if (englishEntry?.title) return englishEntry.title;
+            }
+            return tmdbMetadata.originalTitle;
+          })();
           metaSources.push({
             imdb_id: incomingImdbId,
             tmdb_id: String(tmdbMetadata.tmdbId),
-            title: tmdbMetadata.originalTitle,
+            title: tmdbDisplayTitle,
             year: tmdbMetadata.year,
             _tmdbTitles: tmdbMetadata.titles, // Store for later use
           });
@@ -2190,6 +2363,18 @@ async function streamHandler(req, res) {
 
       console.log('[REQUEST] Resolved title/year', { movieTitle, releaseYear, elapsedMs: Date.now() - requestStartTs });
 
+      // Anime: inject best title and year if still missing after TMDb/Cinemeta
+      if (isAnimeRequest && animeResolved) {
+        if (!movieTitle && animeResolved.originalTitle) {
+          movieTitle = animeResolved.originalTitle;
+          console.log(`[ANIME] Using anime title as movieTitle: ${movieTitle}`);
+        }
+        if (!releaseYear && animeResolved.year) {
+          releaseYear = animeResolved.year;
+          console.log(`[ANIME] Using anime year: ${releaseYear}`);
+        }
+      }
+
       const isCinemetaTitleSource = Boolean(
         cinemetaTitleCandidate
         && movieTitle
@@ -2255,8 +2440,20 @@ async function streamHandler(req, res) {
             const normalizedYearOnly = /^\d{4}$/.test(normalizedValue);
             const normalizedEpisodeOnly = /^s\d{2}e\d{2}$/i.test(normalizedValue) || /^s\d{2}$/i.test(normalizedValue) || /^e\d{2}$/i.test(normalizedValue);
             const rawHadNonAscii = /[^\x00-\x7F]/.test(rawFallback);
+            // Check if ASCII normalization destroyed the title (e.g. CJK → digits only)
+            const normalizedTitleOnly = searchTitle ? tmdbService.normalizeToAscii(searchTitle).trim() : '';
+            const titleLetters = normalizedTitleOnly.replace(/[^a-zA-Z]/g, '');
+            const originalTitleLength = (searchTitle || '').replace(/\s+/g, '').length;
+            const normalizedTitleUsable = titleLetters.length >= 2
+              && (originalTitleLength === 0 || normalizedTitleOnly.length / originalTitleLength >= 0.7);
             if (normalizedYearOnly || normalizedEpisodeOnly) {
               console.log(`${INDEXER_LOG_PREFIX} Skipping text search plan (normalized to episode/year only)`, { original: rawFallback, normalized: normalizedValue });
+            } else if (!normalizedTitleUsable && rawHadNonAscii) {
+              console.log(`${INDEXER_LOG_PREFIX} Skipping text search plan (ASCII normalization lost too much of the title)`, {
+                original: searchTitle,
+                normalized: normalizedTitleOnly,
+                retainedRatio: originalTitleLength > 0 ? (normalizedTitleOnly.length / originalTitleLength).toFixed(2) : 'N/A',
+              });
             } else if (normalizedValue) {
               const addedTextPlan = addPlan('search', { rawQuery: textQueryFallbackValue });
               if (addedTextPlan) {
@@ -2298,6 +2495,29 @@ async function streamHandler(req, res) {
             }
           });
         }
+
+        // Anime title-based searches: add search plans for each known title variant
+        if (isAnimeRequest && animeResolved && animeResolved.titles && animeResolved.titles.length > 0) {
+          const searchableTitles = animeDatabase.getSearchableTitles(animeResolved.titles);
+          console.log(`[ANIME] Adding up to ${searchableTitles.length} anime title search plans`);
+          for (const titleObj of searchableTitles) {
+            let normalizedQuery = titleObj.asciiTitle;
+            if (type === 'movie' && Number.isFinite(releaseYear)) {
+              normalizedQuery = `${normalizedQuery} ${releaseYear}`;
+            } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
+              normalizedQuery = `${normalizedQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
+            }
+
+            const added = addPlan('search', { rawQuery: normalizedQuery });
+            if (added) {
+              console.log(`${INDEXER_LOG_PREFIX} Added anime title search plan`, { query: normalizedQuery, original: titleObj.title });
+            }
+
+            if (!tmdbLocalizedQuery) {
+              tmdbLocalizedQuery = normalizedQuery;
+            }
+          }
+        }
       } else {
         const reason = INDEXER_MANAGER_STRICT_ID_MATCH ? 'strict ID matching enabled' : 'text search disabled';
         console.log(`${INDEXER_LOG_PREFIX} ${reason}; skipping text-based search`);
@@ -2338,6 +2558,20 @@ async function streamHandler(req, res) {
               }
               console.log('[EASYNEWS] Using ASCII title from TMDb:', easynewsRawQuery);
             }
+          }
+        }
+
+        // Anime: use best ASCII anime title for Easynews if no TMDb title found
+        if (!easynewsRawQuery && isAnimeRequest && animeResolved && animeResolved.titles) {
+          const searchable = animeDatabase.getSearchableTitles(animeResolved.titles);
+          if (searchable.length > 0) {
+            easynewsRawQuery = searchable[0].asciiTitle;
+            if (type === 'movie' && Number.isFinite(releaseYear)) {
+              easynewsRawQuery = `${easynewsRawQuery} ${releaseYear}`;
+            } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
+              easynewsRawQuery = `${easynewsRawQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
+            }
+            console.log('[EASYNEWS] Using anime title:', easynewsRawQuery);
           }
         }
 
@@ -2388,7 +2622,7 @@ async function streamHandler(req, res) {
           easynewsSearchParams = {
             rawQuery: easynewsRawQuery,
             fallbackQuery: textQueryFallbackValue || baseIdentifier || movieTitle || '',
-            year: type === 'movie' ? releaseYear : null,
+            year: Number.isFinite(releaseYear) ? releaseYear : null,
             season: type === 'series' ? seasonNum : null,
             episode: type === 'series' ? episodeNum : null,
             strictMode: easynewsStrictMode,
@@ -2466,6 +2700,27 @@ async function streamHandler(req, res) {
           }
           return false;
         }
+        // Additional Levenshtein similarity check on parsed titles to reject false positives
+        // e.g. "The Kingdom" vs "The Last Kingdom" pass first/last word but fail similarity
+        const queryParsedTitle = (() => {
+          try {
+            const parsed = parseReleaseMetadata(plan.query || plan.strictPhrase);
+            return parsed?.parsedTitle || null;
+          } catch (_) { return null; }
+        })();
+        if (!titleSimilarityCheck(candidateTitle, queryParsedTitle)) {
+          if (isNewznabDebugEnabled()) {
+            console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (title similarity too low)`, {
+              candidate: candidateTitle,
+              query: queryParsedTitle,
+              normCandidate: normaliseTitle(candidateTitle),
+              normQuery: normaliseTitle(queryParsedTitle),
+              ratio: levenshteinRatio(normaliseTitle(candidateTitle), normaliseTitle(queryParsedTitle)).toFixed(3),
+              threshold: TITLE_SIMILARITY_THRESHOLD,
+            });
+          }
+          return false;
+        }
         if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
           if (!Number.isFinite(annotated?.season) || !Number.isFinite(annotated?.episode)) {
             if (isNewznabDebugEnabled()) {
@@ -2509,6 +2764,20 @@ async function streamHandler(req, res) {
               console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (year mismatch)`, {
                 title: candidateTitle,
                 year: annotated?.year ?? null,
+                expectedYear: releaseYear,
+                query: plan.query,
+              });
+            }
+            return false;
+          }
+        }
+        // For series: if the NZB has a year and we know the release year, reject on mismatch (±1 tolerance)
+        if (type === 'series' && Number.isFinite(releaseYear) && Number.isFinite(annotated?.year)) {
+          if (Math.abs(Number(annotated.year) - Number(releaseYear)) > 1) {
+            if (isNewznabDebugEnabled()) {
+              console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (series year mismatch)`, {
+                title: candidateTitle,
+                year: annotated.year,
                 expectedYear: releaseYear,
                 query: plan.query,
               });
@@ -3713,9 +3982,7 @@ async function streamHandler(req, res) {
               inheritedFromTitle: triageDerivedFromTitle,
             };
             stream.meta.healthCheck.archiveFindings = archiveFindings;
-            if (triageInfo.sourceDownloadUrl) {
-              stream.meta.healthCheck.sourceDownloadUrl = triageInfo.sourceDownloadUrl;
-            }
+            // sourceDownloadUrl intentionally omitted — contains indexer API keys
           } else {
             stream.meta.healthCheck = {
               status: triageOutcome?.timedOut ? 'pending' : 'not-run',
