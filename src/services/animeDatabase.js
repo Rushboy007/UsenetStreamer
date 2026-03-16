@@ -252,34 +252,58 @@ function collectTitles(idType, id, fribbMapping, kitsuEntry) {
 
 /**
  * Normalize text to ASCII for search queries (same as tmdb.js normalizeToAscii).
+ * Also strips apostrophes/quotes since Usenet/torrent release names never use them.
  */
 function normalizeToAscii(text) {
   if (!text) return '';
   return text
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\x00-\x7F]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')  // strip combining diacritics
+    .replace(/[^a-zA-Z0-9\s-]/g, '')  // keep only alphanumeric, spaces, hyphens
+    .replace(/\s{2,}/g, ' ')           // collapse multiple spaces
     .trim();
 }
 
 /**
- * Filter titles to only those that produce a usable ASCII search query.
- * Returns { title, asciiTitle } objects.
+ * Filter and rank titles to only those useful for Usenet text search.
+ * Returns at most `limit` { title, asciiTitle } objects, prioritized:
+ *   1. Titles whose original text is Latin-script (English/romaji/European)
+ *   2. Earlier titles in the source list (Manami puts the canonical title first)
+ *   3. Skip pure-CJK, very short (≤3 chars), and number-only titles
+ * Deduplicates by normalized ASCII key (lowercase alphanumeric only).
  */
-function getSearchableTitles(titles) {
-  const results = [];
-  const seen = new Set();
-  for (const title of titles) {
+function getSearchableTitles(titles, limit = 3) {
+  const candidates = [];
+  const seenNormalized = new Set();
+
+  for (let i = 0; i < titles.length; i++) {
+    const title = titles[i];
     const ascii = normalizeToAscii(title);
-    if (!ascii || ascii.length < 2) continue;
-    // Skip if it's just numbers
+    if (!ascii || ascii.length <= 3) continue;
     if (/^\d+$/.test(ascii)) continue;
-    const key = ascii.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    results.push({ title, asciiTitle: ascii });
+
+    // Dedup by lowercase alphanumeric
+    const dedup = ascii.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!dedup || dedup.length <= 2) continue;
+    if (seenNormalized.has(dedup)) continue;
+    seenNormalized.add(dedup);
+
+    // Reject titles that are mostly non-Latin (CJK, Cyrillic, Arabic, Thai, etc.)
+    const nonBasicLatin = title.replace(/[\x00-\x7F\u00C0-\u024F\u2018-\u201F]/g, '');
+    if (nonBasicLatin.length > title.length * 0.1) continue;
+
+    // Score: position bonus (first titles are most canonical) + moderate word bonus
+    // Position 0 gets +50, position 1 gets +49, etc.
+    // Word bonus capped at 3 words to avoid long subtitle variants dominating
+    const positionBonus = Math.max(0, 50 - i);
+    const wordCount = Math.min(3, ascii.split(/\s+/).filter(w => w.length > 1).length);
+    const score = positionBonus + wordCount * 5;
+
+    candidates.push({ title, asciiTitle: ascii, score });
   }
-  return results;
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates.slice(0, limit).map(({ title, asciiTitle }) => ({ title, asciiTitle }));
 }
 
 // --- Data loading ---

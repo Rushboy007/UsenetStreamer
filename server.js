@@ -1319,6 +1319,10 @@ function decodeStreamParams(encoded) {
   }
 }
 
+// Eagerly initialize the stream-params encryption key so it appears in
+// runtime-env.json immediately on first startup (not deferred to first request).
+getStreamParamsKey();
+
 function buildStreamCacheKey({ type, id, query = {}, requestedEpisode = null }) {
   const normalizedQuery = {};
   Object.keys(query)
@@ -2445,7 +2449,7 @@ async function streamHandler(req, res) {
             const titleLetters = normalizedTitleOnly.replace(/[^a-zA-Z]/g, '');
             const originalTitleLength = (searchTitle || '').replace(/\s+/g, '').length;
             const normalizedTitleUsable = titleLetters.length >= 2
-              && (originalTitleLength === 0 || normalizedTitleOnly.length / originalTitleLength >= 0.7);
+              && (originalTitleLength === 0 || normalizedTitleOnly.length / originalTitleLength >= 0.8);
             if (normalizedYearOnly || normalizedEpisodeOnly) {
               console.log(`${INDEXER_LOG_PREFIX} Skipping text search plan (normalized to episode/year only)`, { original: rawFallback, normalized: normalizedValue });
             } else if (!normalizedTitleUsable && rawHadNonAscii) {
@@ -2619,6 +2623,8 @@ async function streamHandler(req, res) {
         }
 
         if (easynewsRawQuery) {
+          // Normalize Easynews query: strip punctuation that never appears in release names
+          easynewsRawQuery = tmdbService.normalizeToAscii(easynewsRawQuery);
           easynewsSearchParams = {
             rawQuery: easynewsRawQuery,
             fallbackQuery: textQueryFallbackValue || baseIdentifier || movieTitle || '',
