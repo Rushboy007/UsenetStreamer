@@ -45,17 +45,15 @@
 - **Auto-advance strategy controls** — choose `on-demand` or `prequeue` behavior for fallback queueing when auto-advance is enabled.
 - **Custom sorting chain by priority** — `NZB_SORT_ORDER` now drives ordering with explicit keys (including `date` and `files`), with default chain `quality,size,files`.
 - **Per-indexer capability gating** — ID-based plans run only on indexers that advertise required caps support (e.g., skip `imdbid` tvsearch where unsupported).
-- **Easynews post-date parsing fix** — uses real post date fields (`ts`/`timestamp`/post-date column) instead of fallbacking to "now".
-- **TMDb title handling improvements** — English title preference is respected for search plans and Smart Play labeling when available.
+- **Anime ID support** — accepts `kitsu:`, `mal:`, and `anilist:` IDs and resolves them to IMDb/TVDb via bundled mapping databases (Fribb, Kitsu-IMDB, Manami).
 
 ### 🚀 Performance & Caching
 - Parallel queries to Prowlarr or NZBHydra with automatic deduplication.
 - Two-tier cache (Stremio responses + verified NZBs) to keep repeat requests instant.
-- Configurable TTLs and size limits so you can tune memory usage for any server.
 
 ### 🔍 Smart Search & Language Filtering
 - IMDb/TMDb/TVDb and anime-ID (`kitsu:`, `mal:`, `anilist:`) aware search plans with TVDB-prefixed ID support (no Cinemeta needed). Anime IDs are resolved to IMDb/TVDb via bundled mapping databases.
-- Release titles parsed for resolution, quality, and audio language, enabling `quality_then_size` or `language_quality_size` sorting.
+- Release titles parsed for resolution, quality, and audio language — sorting is fully configurable via `NZB_SORT_ORDER` (e.g. `quality,size,files`, `language,quality,date`, or any combination).
 - Preferred language groups (single or multiple) rise to the top and display with clear 🌐 labels.
 - Optional dedupe filter (enabled by default) collapses duplicates when normalized title + Usenet group match within the publish window; keeps preferred result by paid indexer, then lower file count.
 - A single per-quality cap (e.g., 4) keeps only the first few results for each resolution before falling back to the next tier.
@@ -77,9 +75,8 @@
 - Decisions are cached per download URL and per normalized title, so later requests inherit health verdicts instantly.
 
 ### 🔐 Secure-by-Default
-- Shared-secret gate ensures only URLs with `/your-secret/` can load the manifest or streams.
-- Admin secret and stream token are separated and validated to avoid accidentally exposing broad admin access in stream URLs.
-- Stream tokenized routes are supported via `/your-stream-token/...` while keeping admin protections intact.
+- **Admin token** — used to access the admin dashboard where you can edit settings and credentials. Credentials are write-only (never exposed back to the UI).
+- **Stream token** — a separate token used only for streaming; it cannot access the admin dashboard or modify any settings.
 
 ---
 
@@ -134,26 +131,6 @@ services:
 ```
 
 Then browse to `https://your-domain/super-secret-token/admin/` to enter your credentials. The `CONFIG_DIR` variable tells the addon to store `runtime-env.json` under the mounted path so your admin settings survive container recreations. The container ships with Node 20, exposes port 7000, and supports both `linux/amd64` and `linux/arm64` thanks to `buildx`.
-
-### Source installation
-
-```bash
-# Clone the repository including submodules
-git clone --recursive https://github.com/Sanket9225/UsenetStreamer.git
-cd UsenetStreamer
-
-# Install dependencies and build the parser library
-npm install
-npm run build:parser
-
-# Start the server
-npm start
-```
-
-> [!NOTE]
-> The `build:parser` step is required to compile the `@viren070/parse-torrent-title` submodule into a compatible CommonJS module used by the addon. If you didn't clone with `--recursive`, run `git submodule update --init --recursive` before building.
-
-Create `.env` (see `.env.example`) or, better, load `http://localhost:7000/<token>/admin/` to configure everything from the UI.
 
 ### Reverse proxy & HTTPS
 
