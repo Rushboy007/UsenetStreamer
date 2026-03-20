@@ -631,8 +631,8 @@ health'></textarea>
               <span class="field-hint">Pick 2 for the fastest responses, 4 or 6 to probe more candidates.</span>
             </label>
             <label>Max Usenet Connections
-              <input name="NZB_TRIAGE_MAX_CONNECTIONS" type="number" min="1" step="1" data-health-required="true" />
-              <span class="field-hint">Keep this ≤ 2 × “Number of NZBs to Inspect”, and ensure the combined total of these connections plus any NZBDav connections stays within your provider’s max.</span>
+              <input name="NZB_TRIAGE_MAX_CONNECTIONS" type="number" min="2" max="12" step="1" data-health-required="true" />
+              <span class="field-hint">Choose between 4 and 12. <strong>Ensure the combined total of these connections plus any NZBDav connections stays within your provider's max.</strong></span>
             </label>
 
           </div>
