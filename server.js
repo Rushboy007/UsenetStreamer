@@ -59,7 +59,7 @@ const diskNzbCache = require('./src/cache/diskNzbCache');
 
 const app = express();
 let currentPort = Number(process.env.PORT || 7000);
-const ADDON_VERSION = '1.7.7';
+const ADDON_VERSION = '1.7.8';
 const DEFAULT_ADDON_NAME = 'UsenetStreamer';
 let serverInstance = null;
 const SERVER_HOST = '0.0.0.0';
@@ -5199,9 +5199,15 @@ function startHttpServer() {
   if (serverInstance) {
     return serverInstance;
   }
+
+  const keepAliveTimeoutMs = 65000;
+  const headersTimeoutMs = 70000;
+
   serverInstance = app.listen(currentPort, SERVER_HOST, () => {
     console.log(`Addon running at http://${SERVER_HOST}:${currentPort}`);
   });
+  serverInstance.keepAliveTimeout = keepAliveTimeoutMs;
+  serverInstance.headersTimeout = headersTimeoutMs;
   serverInstance.on('close', () => {
     serverInstance = null;
   });

@@ -3,6 +3,8 @@ const axios = require('axios');
 const FormData = require('form-data');
 const path = require('path');
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const { promisify } = require('util');
 const { pipeline } = require('stream');
 const cache = require('../cache');
@@ -26,6 +28,10 @@ let NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
 let NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
 let NZBDAV_POLL_INTERVAL_MS = 1000;
 let NZBDAV_POLL_TIMEOUT_MS = 240000;
+let NZBDAV_STREAM_PREFETCH_HEAD = (() => {
+  const raw = (process.env.NZBDAV_STREAM_PREFETCH_HEAD || '').trim().toLowerCase();
+  return raw !== '0' && raw !== 'false' && raw !== 'no' && raw !== 'off';
+})();
 let NZBDAV_HISTORY_FETCH_LIMIT = (() => {
   const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 500) : 400;
@@ -33,6 +39,30 @@ let NZBDAV_HISTORY_FETCH_LIMIT = (() => {
 
 // WebDAV client cache (must be declared before reloadConfig)
 let webdavClientPromise = null;
+
+// Keep-alive agents for upstream NZBDav proxy requests
+const nzbdavHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
+const nzbdavHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
+
+// File size cache: avoids repeated upstream HEAD/range probes for known files
+const FILE_SIZE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const fileSizeCache = new Map();
+
+function getCachedFileSize(urlKey) {
+  const entry = fileSizeCache.get(urlKey);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > FILE_SIZE_CACHE_TTL_MS) {
+    fileSizeCache.delete(urlKey);
+    return null;
+  }
+  return entry.size;
+}
+
+function setCachedFileSize(urlKey, size) {
+  if (Number.isFinite(size) && size > 0) {
+    fileSizeCache.set(urlKey, { size, ts: Date.now() });
+  }
+}
 
 function resetWebdavClient() {
   webdavClientPromise = null;
@@ -51,6 +81,10 @@ function reloadConfig() {
   NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
   NZBDAV_POLL_INTERVAL_MS = 1000;
   NZBDAV_POLL_TIMEOUT_MS = 240000;
+  NZBDAV_STREAM_PREFETCH_HEAD = (() => {
+    const raw = (process.env.NZBDAV_STREAM_PREFETCH_HEAD || '').trim().toLowerCase();
+    return raw !== '0' && raw !== 'false' && raw !== 'no' && raw !== 'off';
+  })();
   NZBDAV_HISTORY_FETCH_LIMIT = (() => {
     const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
     return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 500) : 400;
@@ -71,7 +105,7 @@ const STREAM_HIGH_WATER_MARK = (() => {
 })();
 const FAILURE_VIDEO_PATH = path.resolve(__dirname, '../../assets', 'failure_video.mp4');
 const VIDEO_TYPE_FAILURE_PATH = path.resolve(__dirname, '../../assets', 'video_type_failure.mp4');
-const ADDON_VERSION = '1.7.7';
+const ADDON_VERSION = '1.7.8';
 
 function ensureNzbdavConfigured() {
   if (!NZBDAV_URL) {
@@ -798,8 +832,8 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
     return;
   }
 
-  const emulateHead = originalMethod === 'HEAD';
-  const proxiedMethod = emulateHead ? 'GET' : originalMethod;
+  const isHead = originalMethod === 'HEAD';
+  const proxiedMethod = originalMethod;
 
   const normalizedPath = normalizeNzbdavPath(viewPath);
   const encodedPath = normalizedPath
@@ -847,12 +881,9 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
   if (req.headers['accept-encoding']) headers['Accept-Encoding'] = req.headers['accept-encoding'];
   if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
   if (!headers['Accept-Encoding']) headers['Accept-Encoding'] = 'identity';
-  if (emulateHead && !headers.Range) {
-    headers.Range = 'bytes=0-0';
-  }
 
-  let totalFileSize = null;
-  if (!req.headers.range && !emulateHead) {
+  let totalFileSize = getCachedFileSize(targetUrl);
+  if (NZBDAV_STREAM_PREFETCH_HEAD && !req.headers.range && !isHead && !totalFileSize) {
     const headConfig = {
       url: targetUrl,
       method: 'HEAD',
@@ -860,7 +891,9 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
         'User-Agent': headers['User-Agent'] || `UsenetStreamer/${ADDON_VERSION}`
       },
       timeout: 30000,
-      validateStatus: (status) => status < 500
+      validateStatus: (status) => status < 500,
+      httpAgent: nzbdavHttpAgent,
+      httpsAgent: nzbdavHttpsAgent
     };
 
     if (NZBDAV_WEBDAV_USER && NZBDAV_WEBDAV_PASS) {
@@ -879,6 +912,7 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
       const headContentLength = headHeadersLower['content-length'];
       if (headContentLength) {
         totalFileSize = Number(headContentLength);
+        setCachedFileSize(targetUrl, totalFileSize);
         console.log(`[NZBDAV] HEAD reported total size ${totalFileSize} bytes for ${normalizedPath}`);
       }
     } catch (headError) {
@@ -886,13 +920,31 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
     }
   }
 
+  // For HEAD with cached size, respond immediately without upstream request
+  if (isHead && totalFileSize) {
+    const inferredMime = inferMimeType(sanitizedFileName);
+    res.status(200);
+    res.setHeader('Content-Type', inferredMime);
+    res.setHeader('Content-Length', String(totalFileSize));
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Disposition', `inline; filename="${sanitizedFileName}"`);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
+    res.setHeader('X-Total-Length', String(totalFileSize));
+    console.log(`[NZBDAV] HEAD served from cache for ${normalizedPath} (${totalFileSize} bytes)`);
+    res.end();
+    return;
+  }
+
   const requestConfig = {
     url: targetUrl,
     method: proxiedMethod,
     headers,
-    responseType: 'stream',
-    timeout: NZBDAV_STREAM_TIMEOUT_MS,
-    validateStatus: (status) => status < 500
+    responseType: isHead ? undefined : 'stream',
+    timeout: isHead ? 30000 : NZBDAV_STREAM_TIMEOUT_MS,
+    validateStatus: (status) => status < 500,
+    httpAgent: nzbdavHttpAgent,
+    httpsAgent: nzbdavHttpsAgent
   };
 
   if (NZBDAV_WEBDAV_USER && NZBDAV_WEBDAV_PASS) {
@@ -902,7 +954,7 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
     };
   }
 
-  console.log(`[NZBDAV] Proxying ${proxiedMethod}${emulateHead ? ' (HEAD emulation)' : ''} ${targetUrl}`);
+  console.log(`[NZBDAV] Proxying ${proxiedMethod} ${targetUrl}`);
 
   const nzbdavResponse = await axios.request(requestConfig);
 
@@ -973,6 +1025,7 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
       }
       if (Number.isFinite(totalSize)) {
         res.setHeader('X-Total-Length', String(totalSize));
+        setCachedFileSize(targetUrl, totalSize);
       }
     }
   } else if ((!contentLengthHeader || Number(contentLengthHeader) === 0) && Number.isFinite(totalFileSize)) {
@@ -982,7 +1035,15 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
 
-  if (emulateHead || !nzbdavResponse.data || typeof nzbdavResponse.data.pipe !== 'function') {
+  // Cache file size from upstream HEAD Content-Length
+  if (isHead) {
+    const headCL = responseHeadersLower['content-length'];
+    if (headCL) setCachedFileSize(targetUrl, Number(headCL));
+    res.end();
+    return;
+  }
+
+  if (!nzbdavResponse.data || typeof nzbdavResponse.data.pipe !== 'function') {
     if (nzbdavResponse.data && typeof nzbdavResponse.data.destroy === 'function') {
       nzbdavResponse.data.destroy();
     }
