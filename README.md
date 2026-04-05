@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://discord.gg/tUwNjXSZZN"><img src="https://img.shields.io/badge/Discord-Join-blue?logo=discord&logoColor=white" alt="Join Discord" /></a>
-  <a href="https://buymeacoffee.com/gaikwadsank"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-yellow?logo=buymeacoffee&logoColor=white" alt="Buy me a coffee" /></a>
+  <a href="https://github.com/sponsors/Sanket9225"><img src="https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa?logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub" /></a>
   <a href="https://ghcr.io/sanket9225/usenetstreamer"><img src="https://img.shields.io/badge/Docker-ghcr.io%2Fsanket9225%2Fusenetstreamer-blue?logo=docker" alt="Docker image" /></a>
 </p>
 
@@ -23,7 +23,7 @@
 - **Admin dashboard:** `https://your-addon-domain/<admin-token (ADDON_SHARED_SECRET)>/admin/`
 - **Manifest template:** `https://your-addon-domain/<stream-token>/manifest.json`
 - **Discord:** [Community chat](https://discord.gg/tUwNjXSZZN)
-- **Support:** [Buy me a coffee](https://buymeacoffee.com/gaikwadsank)
+- **Sponsor:** [GitHub Sponsors](https://github.com/sponsors/Sanket9225)
 - **Self-hosting guide:** [Jump to instructions](#-deployment)
 
 ---
@@ -32,9 +32,9 @@
 
 > **⚠️ Upgrade notice:** If you are upgrading from a version older than 1.7.6, you may need to reinstall the addon in Stremio for changes to take effect.
 
-## ☕ Support Development
+## 💜 Support Development
 
-**[Buy Me A Coffee &rarr;](https://buymeacoffee.com/gaikwadsank)** — every cup keeps the addon maintained, hosted, and packed with new features.
+**[Sponsor on GitHub &rarr;](https://github.com/sponsors/Sanket9225)** — your sponsorship keeps the addon maintained, hosted, and packed with new features.
 
 ---
 
@@ -220,7 +220,7 @@ Anything that can load HTTPS manifests and handle `externalPlayer` hints should 
 ## 🤝 Support & Community
 
 - **Discord:** [Join the chat](https://discord.gg/tUwNjXSZZN)
-- **Buy me a coffee:** [Keep development humming](https://buymeacoffee.com/gaikwadsank)
+- **Sponsor:** [Keep development humming](https://github.com/sponsors/Sanket9225)
 - **Issues & PRs:** [GitHub tracker](https://github.com/Sanket9225/UsenetStreamer/issues)
 
 Huge thanks to everyone testing, filing bugs, and sharing feature ideas.

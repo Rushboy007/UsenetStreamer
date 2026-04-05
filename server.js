@@ -262,6 +262,9 @@ const FROZEN_KEYS = new Set(['ADDON_SHARED_SECRET', 'STREAMING_MODE']);
 
 adminApiRouter.get('/config', (req, res) => {
   const values = collectConfigValues(ADMIN_CONFIG_KEYS);
+  if (!values.STREAMING_MODE) {
+    values.STREAMING_MODE = 'nzbdav';
+  }
   if (!values.NZB_MAX_RESULT_SIZE_GB) {
     values.NZB_MAX_RESULT_SIZE_GB = String(DEFAULT_MAX_RESULT_SIZE_GB);
   }
