@@ -865,6 +865,7 @@
       applyQualitySelectionsFromHidden();
       applySortOrderFromHidden();
       applyTmdbLanguageSelectionsFromHidden();
+      syncTmdbLanguageControls();
       refreshNewznabFieldNames();
       syncStreamProtectionControls(true);
       syncSortingControls();

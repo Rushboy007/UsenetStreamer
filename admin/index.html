@@ -643,7 +643,7 @@ health'></textarea>
         </section>
 
         <section class="group">
-          <h3>TMDb Metadata & Localization (Optional)</h3>
+          <h3>TMDb Metadata & Localization (Recommended)</h3>
           <p class="hint">When enabled, fetches metadata directly from TMDb (skips Cinemeta) and adds localized title searches for non-English content. Example: A Telugu movie will search with its original Telugu title, English title, and any additional languages you select below.</p>
           <label class="checkbox">
             <input name="TMDB_ENABLED" type="checkbox" />
@@ -664,7 +664,7 @@ health'></textarea>
           </div>
           <div class="tmdb-language-block language-multiselect wide-field" data-tmdb-language-selector>
             <div class="language-header">
-              <span class="field-label">Additional Languages (Not recommended)</span>
+              <span class="field-label">Additional Languages</span>
               <span class="field-hint">Select additional languages to search with, along with auto-detected language. Leave empty to use only auto-detected language.</span>
             </div>
             <input type="hidden" name="TMDB_SEARCH_LANGUAGES" data-tmdb-language-hidden />
@@ -755,7 +755,7 @@ health'></textarea>
         </section>
 
         <section class="group">
-          <h3>TVDB ID Mapping (Optional)</h3>
+          <h3>TVDB ID Mapping (Recommended)</h3>
           <p class="hint">Enable to resolve TVDB ↔ IMDb IDs for series. This improves ID-based searches when only one of the IDs is available.</p>
           <label class="checkbox">
             <input name="TVDB_ENABLED" type="checkbox" />

@@ -55,6 +55,7 @@ const { normalizeUsenetGroup, extractUsenetGroup, extractFileCount, parseAllowed
 const { getStreamParamsKey, encodeStreamParams, decodeStreamParams } = require('./src/utils/streamParams');
 const { isNewznabDebugEnabled, isNewznabEndpointLoggingEnabled, logNewznabDebug } = require('./src/services/newznabDebug');
 const { getPaidDirectIndexerTokens, buildPaidIndexerLimitMap } = require('./src/services/newznabIndexerLimits');
+const { buildEasynewsSearchParams } = require('./src/services/easynews/queryBuilder');
 const createManifestHandler = require('./src/routes/manifest');
 const createCatalogHandler = require('./src/routes/catalog');
 const createMetaHandler = require('./src/routes/meta');
@@ -2095,128 +2096,58 @@ async function streamHandler(req, res) {
       }
 
       if (easynewsService.isEasynewsEnabled()) {
-        const easynewsStrictMode = !isSpecialRequest && (type === 'movie' || type === 'series');
-        let easynewsRawQuery = null;
-
-        // Check if we have TMDb titles - prefer English titles for Easynews
-        const tmdbTitles = metaSources.find(s => s?._tmdbTitles)?._tmdbTitles;
-        if (tmdbTitles && tmdbTitles.length > 0) {
-          // Find English title first
-          const englishTitle = tmdbTitles.find(t => t.language && t.language.startsWith('en-'));
-          if (englishTitle) {
-            easynewsRawQuery = englishTitle.title;
-            if (type === 'movie' && Number.isFinite(releaseYear)) {
-              easynewsRawQuery = `${easynewsRawQuery} ${releaseYear}`;
-            } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
-              easynewsRawQuery = `${easynewsRawQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
-            }
-            console.log('[EASYNEWS] Using English title from TMDb:', easynewsRawQuery);
-          } else {
-            // No English title, try ASCII-safe titles only
-            const asciiTitle = tmdbTitles.find(t => t.title && !/[^\x00-\x7F]/.test(t.title));
-            if (asciiTitle) {
-              easynewsRawQuery = asciiTitle.title;
-              if (type === 'movie' && Number.isFinite(releaseYear)) {
-                easynewsRawQuery = `${easynewsRawQuery} ${releaseYear}`;
-              } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
-                easynewsRawQuery = `${easynewsRawQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
-              }
-              console.log('[EASYNEWS] Using ASCII title from TMDb:', easynewsRawQuery);
-            }
-          }
-        }
-
-        // Anime: use best ASCII anime title for Easynews if no TMDb title found
-        if (!easynewsRawQuery && isAnimeRequest && animeResolved && animeResolved.titles) {
-          const searchable = animeDatabase.getSearchableTitles(animeResolved.titles);
-          if (searchable.length > 0) {
-            easynewsRawQuery = searchable[0].asciiTitle;
-            if (type === 'movie' && Number.isFinite(releaseYear)) {
-              easynewsRawQuery = `${easynewsRawQuery} ${releaseYear}`;
-            } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
-              easynewsRawQuery = `${easynewsRawQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
-            }
-            console.log('[EASYNEWS] Using anime title:', easynewsRawQuery);
-          }
-        }
-
-        // Fallback to old logic if no TMDb titles
-        if (!easynewsRawQuery) {
-          if (isSpecialRequest) {
-            easynewsRawQuery = (specialMetadataResult?.title || movieTitle || baseIdentifier || '').trim();
-          } else if (easynewsStrictMode) {
-            easynewsRawQuery = (textQueryParts.join(' ').trim() || movieTitle || '').trim();
-          } else {
-            easynewsRawQuery = (textQueryParts.join(' ').trim() || movieTitle || '').trim();
-          }
-          if (!easynewsRawQuery && tmdbLocalizedQuery) {
-            easynewsRawQuery = tmdbLocalizedQuery;
-          }
-          if (!easynewsRawQuery && textQueryFallbackValue) {
-            easynewsRawQuery = textQueryFallbackValue;
-          }
-          if (!easynewsRawQuery && baseIdentifier) {
-            easynewsRawQuery = baseIdentifier;
-          }
-
-          // Skip Easynews if final query contains non-ASCII characters
-          if (easynewsRawQuery && /[^\x00-\x7F]/.test(easynewsRawQuery)) {
-            console.log('[EASYNEWS] Skipping search - query contains non-ASCII characters:', easynewsRawQuery);
-            easynewsRawQuery = null;
-          }
-        }
-
-        if (!easynewsRawQuery && baseIdentifier) {
-          easynewsRawQuery = baseIdentifier;
-        }
-
-        if (easynewsRawQuery) {
-          const trimmedEasynewsQuery = easynewsRawQuery.trim();
-          const easynewsEpisodeOnly = /^s\d{2}e\d{2}$/i.test(trimmedEasynewsQuery);
-          const easynewsYearOnly = /^\d{4}$/.test(trimmedEasynewsQuery);
-          if (easynewsEpisodeOnly) {
-            console.log('[EASYNEWS] Skipping episode-only query (no title)');
-            easynewsRawQuery = baseIdentifier || null;
-          } else if (easynewsYearOnly && (!movieTitle || !movieTitle.trim())) {
-            console.log('[EASYNEWS] Skipping year-only query (no title)');
-            easynewsRawQuery = baseIdentifier || null;
-          }
-        }
-
-        if (easynewsRawQuery) {
-          // Normalize Easynews query: strip punctuation that never appears in release names
-          easynewsRawQuery = tmdbService.normalizeToAscii(easynewsRawQuery);
-          easynewsSearchParams = {
-            rawQuery: easynewsRawQuery,
-            fallbackQuery: textQueryFallbackValue || baseIdentifier || movieTitle || '',
-            year: Number.isFinite(releaseYear) ? releaseYear : null,
-            season: type === 'series' ? seasonNum : null,
-            episode: type === 'series' ? episodeNum : null,
-            strictMode: easynewsStrictMode,
-            specialTextOnly: Boolean(isSpecialRequest || requestLacksIdentifiers),
-          };
-          console.log('[EASYNEWS] Prepared search params, will run in parallel with NZB searches');
+        const animeSearchableTitles = (isAnimeRequest && animeResolved?.titles)
+          ? animeDatabase.getSearchableTitles(animeResolved.titles)
+          : [];
+        easynewsSearchParams = buildEasynewsSearchParams({
+          type,
+          releaseYear,
+          seasonNum,
+          episodeNum,
+          tmdbTitles: metaSources.find(s => s?._tmdbTitles)?._tmdbTitles,
+          isAnimeRequest,
+          animeSearchableTitles,
+          textQueryFallbackValue,
+          movieTitle,
+          baseIdentifier,
+          isSpecialRequest,
+          specialMetadataTitle: specialMetadataResult?.title,
+          requestLacksIdentifiers,
+          strictMode: !isSpecialRequest && (type === 'movie' || type === 'series'),
+          normalizeToAscii: tmdbService.normalizeToAscii,
+        });
+        if (easynewsSearchParams) {
+          console.log('[EASYNEWS] Prepared search queries', { count: easynewsSearchParams.queries.length, queries: easynewsSearchParams.queries });
         }
       }
 
-      // Start Easynews search in parallel if params are ready
+      // Start Easynews searches in parallel (one per query variant, results merged by guid)
       let easynewsPromise = null;
       let easynewsSearchStartTs = null;
       if (easynewsSearchParams) {
-        console.log('[EASYNEWS] Starting search in parallel');
+        const { queries, ...sharedParams } = easynewsSearchParams;
+        console.log(`[EASYNEWS] Starting ${queries.length} search(es) in parallel`);
         easynewsSearchStartTs = Date.now();
-        easynewsPromise = easynewsService.searchEasynews(easynewsSearchParams)
-          .then((results) => {
-            if (Array.isArray(results) && results.length > 0) {
-              console.log('[EASYNEWS] Retrieved results', { count: results.length, query: easynewsSearchParams.rawQuery });
-              return results;
-            }
-            return [];
-          })
-          .catch((error) => {
-            console.warn('[EASYNEWS] Search failed', error.message);
-            return [];
+        easynewsPromise = Promise.all(
+          queries.map((rawQuery) =>
+            easynewsService.searchEasynews({ ...sharedParams, rawQuery })
+              .catch((err) => {
+                console.warn('[EASYNEWS] Query failed:', rawQuery, err.message);
+                return [];
+              })
+          )
+        ).then((resultArrays) => {
+          const seen = new Set();
+          const merged = resultArrays.flat().filter((r) => {
+            if (!r?.guid || seen.has(r.guid)) return false;
+            seen.add(r.guid);
+            return true;
           });
+          if (merged.length > 0) {
+            console.log('[EASYNEWS] Retrieved results', { count: merged.length, queries });
+          }
+          return merged;
+        });
       }
 
       const deriveResultKey = (result) => {
