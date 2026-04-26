@@ -44,7 +44,7 @@ const cache = require('./src/cache');
 const { ensureSharedSecret, ensureAdminSecret, ensureStreamToken, getEffectiveStreamToken } = require('./src/middleware/auth');
 const newznabService = require('./src/services/newznab');
 const easynewsService = require('./src/services/easynews');
-const { toFiniteNumber, toPositiveInt, toBoolean, parseCommaList, parsePathList, normalizeSortMode, resolvePreferredLanguages, resolveLanguageLabel, resolveLanguageLabels, toSizeBytesFromGb, collectConfigValues, computeManifestUrl, stripTrailingSlashes, decodeBase64Value, deriveSortOrder } = require('./src/utils/config');
+const { toFiniteNumber, toPositiveInt, toBoolean, parseCommaList, parsePathList, normalizeSortMode, resolvePreferredLanguages, resolveLanguageLabel, resolveLanguageLabels, toSizeBytesFromGb, toSizeBytesFromMb, collectConfigValues, computeManifestUrl, stripTrailingSlashes, decodeBase64Value, deriveSortOrder } = require('./src/utils/config');
 const { normalizeReleaseTitle, parseRequestedEpisode, isVideoFileName, fileMatchesEpisode, normalizeNzbdavPath, inferMimeType, normalizeIndexerToken, nzbMatchesIndexer, cleanSpecialSearchTitle, parseFilterList, normalizeResolutionToken } = require('./src/utils/parsers');
 const { sanitizeErrorForClient, TRIAGE_FINAL_STATUSES, isTriageFinalStatus, buildStreamCacheKey, restoreTriageDecisions, extractTriageOverrides, sleep, annotateNzbResult, applyMaxSizeFilter, prepareSortedResults, getPreferredLanguageMatch, getPreferredLanguageMatches, triageStatusRank, buildTriageTitleMap, prioritizeTriageCandidates, triageDecisionsMatchStatuses, sanitizeDecisionForCache, serializeFinalNzbResults, restoreFinalNzbResults, safeStat, formatStreamTitle } = require('./src/utils/helpers');
 const { maskSensitiveValues, unsentinelValues, CREDENTIAL_MASK_SENTINEL, SENSITIVE_KEYS, SENSITIVE_KEY_PATTERNS, isSensitiveKey } = require('./src/utils/credentialMask');
@@ -561,6 +561,7 @@ let INDEXER_MAX_RESULT_SIZE_BYTES = toSizeBytesFromGb(
     ? process.env.NZB_MAX_RESULT_SIZE_GB
     : DEFAULT_MAX_RESULT_SIZE_GB
 );
+let INDEXER_MIN_RESULT_SIZE_BYTES = toSizeBytesFromMb(process.env.NZB_MIN_RESULT_SIZE_MB || '45');
 let ALLOWED_RESOLUTIONS = parseAllowedResolutionList(process.env.NZB_ALLOWED_RESOLUTIONS);
 let RELEASE_EXCLUSIONS = parseCommaList(process.env.NZB_RELEASE_EXCLUSIONS);
 let NZB_NAMING_PATTERN = process.env.NZB_NAMING_PATTERN || '';
@@ -817,6 +818,7 @@ function rebuildRuntimeConfig({ log = true } = {}) {
       ? process.env.NZB_MAX_RESULT_SIZE_GB
       : DEFAULT_MAX_RESULT_SIZE_GB
   );
+  INDEXER_MIN_RESULT_SIZE_BYTES = toSizeBytesFromMb(process.env.NZB_MIN_RESULT_SIZE_MB || '45');
   ALLOWED_RESOLUTIONS = parseAllowedResolutionList(process.env.NZB_ALLOWED_RESOLUTIONS);
   RELEASE_EXCLUSIONS = parseCommaList(process.env.NZB_RELEASE_EXCLUSIONS);
   NZB_NAMING_PATTERN = process.env.NZB_NAMING_PATTERN || '';
@@ -2646,6 +2648,9 @@ async function streamHandler(req, res) {
       allowedResolutions: ALLOWED_RESOLUTIONS,
       resolutionLimitPerQuality: RESOLUTION_LIMIT_PER_QUALITY,
     });
+    if (Number.isFinite(INDEXER_MIN_RESULT_SIZE_BYTES) && INDEXER_MIN_RESULT_SIZE_BYTES > 0) {
+      finalNzbResults = finalNzbResults.filter(r => !Number.isFinite(r.size) || r.size >= INDEXER_MIN_RESULT_SIZE_BYTES);
+    }
     if (dedupeEnabled) {
       finalNzbResults = dedupeResultsByTitle(finalNzbResults, PAID_INDEXER_TOKENS);
     }
