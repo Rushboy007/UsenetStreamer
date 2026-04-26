@@ -970,6 +970,9 @@ function executeManagerPlanWithBackoff(plan) {
   if (INDEXER_MANAGER === 'none') {
     return Promise.resolve({ results: [] });
   }
+  if (plan.skipHydra && INDEXER_MANAGER === 'nzbhydra') {
+    return Promise.resolve({ results: [] });
+  }
   if (INDEXER_MANAGER_BACKOFF_ENABLED && indexerManagerUnavailableUntil > Date.now()) {
     const remaining = Math.ceil((indexerManagerUnavailableUntil - Date.now()) / 1000);
     console.warn(`${INDEXER_LOG_PREFIX} Skipping manager search during backoff (${remaining}s remaining)`);
@@ -1753,7 +1756,7 @@ async function streamHandler(req, res) {
     if (!usingCachedSearchResults) {
       const searchPlans = [];
       const seenPlans = new Set();
-      const addPlan = (planType, { tokens = [], rawQuery = null } = {}) => {
+      const addPlan = (planType, { tokens = [], rawQuery = null, skipHydra = false } = {}) => {
         const tokenList = [...tokens];
         if (planType === 'tvsearch') {
           if (seasonToken) tokenList.push(seasonToken);
@@ -1769,7 +1772,7 @@ async function streamHandler(req, res) {
           return false;
         }
         seenPlans.add(planKey);
-        const planRecord = { type: planType, query, rawQuery: rawQuery ? rawQuery : null, tokens: normalizedTokens };
+        const planRecord = { type: planType, query, rawQuery: rawQuery ? rawQuery : null, tokens: normalizedTokens, skipHydra: Boolean(skipHydra) };
         if (strictTextMode && planType === 'search' && rawQuery && !isSpecialRequest) {
           const strictPhrase = sanitizeStrictSearchPhrase(rawQuery);
           if (strictPhrase) {
@@ -1794,7 +1797,7 @@ async function streamHandler(req, res) {
           addPlan('movie', { tokens: [`{ImdbId:${metaIds.imdb}}`] });
         }
         if (metaIds.tmdb) {
-          addPlan('movie', { tokens: [`{TmdbId:${metaIds.tmdb}}`] });
+          addPlan('movie', { tokens: [`{TmdbId:${metaIds.tmdb}}`], skipHydra: Boolean(metaIds.imdb) });
         }
       } else if (metaIds.imdb) {
         addPlan(searchType, { tokens: [`{ImdbId:${metaIds.imdb}}`] });
