@@ -203,6 +203,17 @@ function computeManifestUrl() {
   return `${normalizedBase}${tokenSegment}/manifest.json`;
 }
 
+// Backward compat: derive sort order from legacy NZB_SORT_MODE when NZB_SORT_ORDER is not set
+function deriveSortOrder(rawSortOrder, sortMode) {
+  const explicit = (rawSortOrder || '').trim();
+  if (explicit) return parseCommaList(explicit);
+  switch (sortMode) {
+    case 'language_quality_size': return ['language', 'resolution', 'size'];
+    case 'quality_then_size':    return ['resolution', 'size', 'files'];
+    default:                     return ['resolution', 'size', 'files'];
+  }
+}
+
 module.exports = {
   decodeBase64Value,
   stripTrailingSlashes,
@@ -219,4 +230,5 @@ module.exports = {
   toSizeBytesFromGb,
   collectConfigValues,
   computeManifestUrl,
+  deriveSortOrder,
 };

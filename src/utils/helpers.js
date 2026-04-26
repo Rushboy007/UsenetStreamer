@@ -1,7 +1,7 @@
 // Helper utilities for sorting, filtering, and processing results
 const { parseReleaseMetadata } = require('../services/metadata/releaseParser');
 const { normalizeReleaseTitle } = require('./parsers');
-const { resolveLanguageLabel } = require('./config');
+const { resolveLanguageLabel, toFiniteNumber, toBoolean, parseCommaList } = require('./config');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -653,7 +653,84 @@ async function safeStat(filePath) {
   }
 }
 
+const URL_PATTERN = /https?:\/\/[^\s'"<>)]+/gi;
+function sanitizeErrorForClient(error) {
+  const msg = error?.failureMessage || error?.response?.data?.message || error?.message || 'Internal server error';
+  return msg.replace(URL_PATTERN, '[redacted-url]');
+}
+
+const TRIAGE_FINAL_STATUSES = new Set(['verified', 'blocked', 'unverified_7z']);
+
+function isTriageFinalStatus(status) {
+  if (!status) return false;
+  return TRIAGE_FINAL_STATUSES.has(String(status).toLowerCase());
+}
+
+function buildStreamCacheKey({ type, id, query = {}, requestedEpisode = null }) {
+  const normalizedQuery = {};
+  Object.keys(query)
+    .sort()
+    .forEach((key) => {
+      normalizedQuery[key] = query[key];
+    });
+  const normalizedEpisode = requestedEpisode
+    ? {
+      season: Number.isFinite(requestedEpisode.season) ? requestedEpisode.season : null,
+      episode: Number.isFinite(requestedEpisode.episode) ? requestedEpisode.episode : null,
+    }
+    : null;
+  return JSON.stringify({ type, id, requestedEpisode: normalizedEpisode, query: normalizedQuery });
+}
+
+function restoreTriageDecisions(snapshot) {
+  const map = new Map();
+  if (!Array.isArray(snapshot)) return map;
+  snapshot.forEach(([downloadUrl, decision]) => {
+    if (!downloadUrl || !decision) return;
+    map.set(downloadUrl, { ...decision });
+  });
+  return map;
+}
+
+function extractTriageOverrides(query) {
+  if (!query || typeof query !== 'object') return {};
+  const sizeCandidate = query.maxSizeGb ?? query.max_size_gb ?? query.triageSizeGb ?? query.triage_size_gb ?? query.preferredSizeGb;
+  const sizeGb = toFiniteNumber(sizeCandidate, null);
+  const maxSizeBytes = Number.isFinite(sizeGb) && sizeGb > 0 ? sizeGb * 1024 * 1024 * 1024 : null;
+  let indexerSource = null;
+  if (typeof query.triageIndexerIds === 'string') indexerSource = query.triageIndexerIds;
+  else if (Array.isArray(query.triageIndexerIds)) indexerSource = query.triageIndexerIds.join(',');
+  const indexers = indexerSource ? parseCommaList(indexerSource) : null;
+  const disabled = query.triageDisabled !== undefined ? toBoolean(query.triageDisabled, true) : null;
+  const enabled = query.triageEnabled !== undefined ? toBoolean(query.triageEnabled, false) : null;
+  const sortMode = typeof query.sortMode === 'string' ? query.sortMode : query.nzbSortMode;
+  const preferredLanguageInput = query.preferredLanguages ?? query.preferredLanguage ?? query.language ?? query.lang;
+  let dedupeOverride = null;
+  if (query.dedupe !== undefined) {
+    dedupeOverride = toBoolean(query.dedupe, true);
+  } else if (query.dedupeEnabled !== undefined) {
+    dedupeOverride = toBoolean(query.dedupeEnabled, true);
+  } else if (query.dedupeDisabled !== undefined) {
+    dedupeOverride = !toBoolean(query.dedupeDisabled, false);
+  }
+  return {
+    maxSizeBytes,
+    indexers,
+    disabled,
+    enabled,
+    sortMode: typeof sortMode === 'string' ? sortMode : null,
+    preferredLanguages: typeof preferredLanguageInput === 'string' ? preferredLanguageInput : null,
+    dedupeEnabled: dedupeOverride,
+  };
+}
+
 module.exports = {
+  sanitizeErrorForClient,
+  TRIAGE_FINAL_STATUSES,
+  isTriageFinalStatus,
+  buildStreamCacheKey,
+  restoreTriageDecisions,
+  extractTriageOverrides,
   sleep,
   annotateNzbResult,
   applyMaxSizeFilter,

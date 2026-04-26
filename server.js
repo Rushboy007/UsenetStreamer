@@ -44,9 +44,21 @@ const cache = require('./src/cache');
 const { ensureSharedSecret, ensureAdminSecret, ensureStreamToken, getEffectiveStreamToken } = require('./src/middleware/auth');
 const newznabService = require('./src/services/newznab');
 const easynewsService = require('./src/services/easynews');
-const { toFiniteNumber, toPositiveInt, toBoolean, parseCommaList, parsePathList, normalizeSortMode, resolvePreferredLanguages, resolveLanguageLabel, resolveLanguageLabels, toSizeBytesFromGb, collectConfigValues, computeManifestUrl, stripTrailingSlashes, decodeBase64Value } = require('./src/utils/config');
+const { toFiniteNumber, toPositiveInt, toBoolean, parseCommaList, parsePathList, normalizeSortMode, resolvePreferredLanguages, resolveLanguageLabel, resolveLanguageLabels, toSizeBytesFromGb, collectConfigValues, computeManifestUrl, stripTrailingSlashes, decodeBase64Value, deriveSortOrder } = require('./src/utils/config');
 const { normalizeReleaseTitle, parseRequestedEpisode, isVideoFileName, fileMatchesEpisode, normalizeNzbdavPath, inferMimeType, normalizeIndexerToken, nzbMatchesIndexer, cleanSpecialSearchTitle, parseFilterList, normalizeResolutionToken } = require('./src/utils/parsers');
-const { sleep, annotateNzbResult, applyMaxSizeFilter, prepareSortedResults, getPreferredLanguageMatch, getPreferredLanguageMatches, triageStatusRank, buildTriageTitleMap, prioritizeTriageCandidates, triageDecisionsMatchStatuses, sanitizeDecisionForCache, serializeFinalNzbResults, restoreFinalNzbResults, safeStat, formatStreamTitle } = require('./src/utils/helpers');
+const { sanitizeErrorForClient, TRIAGE_FINAL_STATUSES, isTriageFinalStatus, buildStreamCacheKey, restoreTriageDecisions, extractTriageOverrides, sleep, annotateNzbResult, applyMaxSizeFilter, prepareSortedResults, getPreferredLanguageMatch, getPreferredLanguageMatches, triageStatusRank, buildTriageTitleMap, prioritizeTriageCandidates, triageDecisionsMatchStatuses, sanitizeDecisionForCache, serializeFinalNzbResults, restoreFinalNzbResults, safeStat, formatStreamTitle } = require('./src/utils/helpers');
+const { maskSensitiveValues, unsentinelValues, CREDENTIAL_MASK_SENTINEL, SENSITIVE_KEYS, SENSITIVE_KEY_PATTERNS, isSensitiveKey } = require('./src/utils/credentialMask');
+const { buildTriageNntpConfig, buildNntpServersArray } = require('./src/services/triage/nntpConfig');
+const { sanitizeStrictSearchPhrase, matchesStrictSearch, normaliseTitle, levenshteinRatio, titleSimilarityCheck, TITLE_SIMILARITY_THRESHOLD } = require('./src/utils/stringUtils');
+const { formatResolutionBadge, extractQualityFeatureBadges, summarizeNewznabPlan } = require('./src/utils/formatters');
+const { normalizeUsenetGroup, extractUsenetGroup, extractFileCount, parseAllowedResolutionList, parseResolutionLimitValue, isResultFromPaidIndexer, dedupeResultsByTitle } = require('./src/utils/resultUtils');
+const { getStreamParamsKey, encodeStreamParams, decodeStreamParams } = require('./src/utils/streamParams');
+const { isNewznabDebugEnabled, isNewznabEndpointLoggingEnabled, logNewznabDebug } = require('./src/services/newznabDebug');
+const { getPaidDirectIndexerTokens, buildPaidIndexerLimitMap } = require('./src/services/newznabIndexerLimits');
+const createManifestHandler = require('./src/routes/manifest');
+const createCatalogHandler = require('./src/routes/catalog');
+const createMetaHandler = require('./src/routes/meta');
+const createEasynewsHandler = require('./src/routes/easynews');
 const indexerService = require('./src/services/indexer');
 const nzbdavService = require('./src/services/nzbdav');
 const specialMetadata = require('./src/services/specialMetadata');
@@ -63,7 +75,6 @@ const ADDON_VERSION = '1.7.8';
 const DEFAULT_ADDON_NAME = 'UsenetStreamer';
 let serverInstance = null;
 const SERVER_HOST = '0.0.0.0';
-const DEDUPE_MAX_PUBLISH_DIFF_DAYS = 14;
 let PAID_INDEXER_TOKENS = new Set();
 
 
@@ -73,12 +84,6 @@ const RELEASE_BLOCKLIST_REGEX = /(?:^|[\s.\-_(\[])(?:iso|img|bin|cue|exe)(?:[\s.
 
 const PREFETCH_NZBDAV_JOB_TTL_MS = 60 * 60 * 1000;
 const prefetchedNzbdavJobs = new Map();
-const TRIAGE_FINAL_STATUSES = new Set(['verified', 'blocked', 'unverified_7z']);
-
-function isTriageFinalStatus(status) {
-  if (!status) return false;
-  return TRIAGE_FINAL_STATUSES.has(String(status).toLowerCase());
-}
 
 function prunePrefetchedNzbdavJobs() {
   if (prefetchedNzbdavJobs.size === 0) return;
@@ -123,28 +128,6 @@ async function resolvePrefetchedNzbdavJob(downloadUrl) {
   return entry;
 }
 
-function formatResolutionBadge(resolution) {
-  if (!resolution) return null;
-  const normalized = resolution.toLowerCase();
-
-  if (normalized === '8k' || normalized === '4320p') return '8K';
-  if (normalized === '4k' || normalized === '2160p' || normalized === 'uhd') return '4K';
-
-  if (normalized.endsWith('p')) return normalized.toUpperCase();
-  return resolution;
-}
-
-function extractQualityFeatureBadges(title) {
-  if (!title) return [];
-  const badges = [];
-  QUALITY_FEATURE_PATTERNS.forEach(({ label, regex }) => {
-    if (regex.test(title)) {
-      badges.push(label);
-    }
-  });
-  return badges;
-}
-
 app.use(cors());
 
 // ---------------------------------------------------------------------------
@@ -159,15 +142,6 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Sanitize error messages before sending to clients — strip URLs that could
-// contain internal IPs, API keys, or other sensitive information.
-// ---------------------------------------------------------------------------
-const URL_PATTERN = /https?:\/\/[^\s'"<>)]+/gi;
-function sanitizeErrorForClient(error) {
-  const msg = error?.failureMessage || error?.response?.data?.message || error?.message || 'Internal server error';
-  return msg.replace(URL_PATTERN, '[redacted-url]');
-}
-
 // ---------------------------------------------------------------------------
 // Global guard: ADDON_SHARED_SECRET is mandatory since v1.7.6.
 // Without it, every route returns 503 except a helpful setup hint.
@@ -212,50 +186,6 @@ const adminStatic = express.static(path.join(__dirname, 'admin'), {
     }
   },
 });
-
-// ---------------------------------------------------------------------------
-// Credential masking: sensitive keys are replaced with a sentinel in API
-// responses so plaintext secrets never reach the browser.  On save/test,
-// sentinel values are swapped back to the real process.env value.
-// ---------------------------------------------------------------------------
-const CREDENTIAL_MASK_SENTINEL = '\u200B__MASKED_CREDENTIAL__\u200B';
-const SENSITIVE_KEYS = new Set([
-  'INDEXER_MANAGER_API_KEY',
-  'NZBDAV_API_KEY',
-  'NZBDAV_WEBDAV_PASS',
-  'NZB_TRIAGE_NNTP_PASS',
-  'EASYNEWS_PASSWORD',
-  'TMDB_API_KEY',
-  'TVDB_API_KEY',
-  'SPECIAL_PROVIDER_SECRET',
-]);
-const SENSITIVE_KEY_PATTERNS = [/^NEWZNAB_API_KEY_\d+$/];
-
-function isSensitiveKey(key) {
-  if (SENSITIVE_KEYS.has(key)) return true;
-  return SENSITIVE_KEY_PATTERNS.some((rx) => rx.test(key));
-}
-
-function maskSensitiveValues(values) {
-  const masked = { ...values };
-  Object.keys(masked).forEach((key) => {
-    if (isSensitiveKey(key) && masked[key]) {
-      masked[key] = CREDENTIAL_MASK_SENTINEL;
-    }
-  });
-  return masked;
-}
-
-function unsentinelValues(values) {
-  if (!values || typeof values !== 'object') return values;
-  const resolved = { ...values };
-  Object.keys(resolved).forEach((key) => {
-    if (resolved[key] === CREDENTIAL_MASK_SENTINEL) {
-      resolved[key] = process.env[key] || '';
-    }
-  });
-  return resolved;
-}
 
 // Keys that cannot be changed via the admin API — only via env/docker/filesystem
 const FROZEN_KEYS = new Set(['ADDON_SHARED_SECRET', 'STREAMING_MODE']);
@@ -558,35 +488,6 @@ let NEWZNAB_CONFIGS = newznabService.getEnvNewznabConfigs({ includeEmpty: false 
 let ACTIVE_NEWZNAB_CONFIGS = newznabService.filterUsableConfigs(NEWZNAB_CONFIGS, { requireEnabled: true, requireApiKey: true });
 const NEWZNAB_LOG_PREFIX = '[NEWZNAB]';
 
-function getPaidDirectIndexerTokens(configs = ACTIVE_NEWZNAB_CONFIGS) {
-  return configs
-    .filter((config) => config && config.isPaid && !config.zyclopsEnabled)
-    .map((config) => normalizeIndexerToken(config.slug || config.dedupeKey || config.displayName || config.id))
-    .filter(Boolean);
-}
-
-function buildPaidIndexerLimitMap(configs = ACTIVE_NEWZNAB_CONFIGS) {
-  const limitMap = new Map();
-  (configs || []).forEach((config) => {
-    if (!config || !config.isPaid || config.zyclopsEnabled) return;
-    const limit = Number.isFinite(config.paidLimit) ? config.paidLimit : 6;
-    const tokens = [
-      config.slug,
-      config.dedupeKey,
-      config.displayName,
-      config.name,
-      config.id,
-    ].map((token) => normalizeIndexerToken(token)).filter(Boolean);
-    tokens.forEach((token) => {
-      const existing = limitMap.get(token);
-      if (!existing || limit < existing) {
-        limitMap.set(token, limit);
-      }
-    });
-  });
-  return limitMap;
-}
-
 function buildManagerIndexerLimitMap() {
   if (INDEXER_MANAGER === 'none') {
     return new Map();
@@ -631,55 +532,6 @@ function buildSearchLogPrefix({ manager = INDEXER_MANAGER, managerLabel = INDEXE
 
 INDEXER_LOG_PREFIX = buildSearchLogPrefix();
 
-function isNewznabDebugEnabled() {
-  return Boolean(DEBUG_NEWZNAB_SEARCH || DEBUG_NEWZNAB_TEST || DEBUG_NEWZNAB_ENDPOINTS);
-}
-
-function isNewznabEndpointLoggingEnabled() {
-  return Boolean(DEBUG_NEWZNAB_ENDPOINTS);
-}
-
-function summarizeNewznabPlan(plan) {
-  if (!plan || typeof plan !== 'object') {
-    return null;
-  }
-  return {
-    type: plan.type || null,
-    query: plan.rawQuery || plan.query || null,
-    tokens: Array.isArray(plan.tokens) ? plan.tokens.filter(Boolean) : [],
-  };
-}
-
-function logNewznabDebug(message, context = null) {
-  if (!isNewznabDebugEnabled()) {
-    return;
-  }
-  if (context && Object.keys(context).length > 0) {
-    console.log(`${NEWZNAB_LOG_PREFIX}[DEBUG] ${message}`, context);
-  } else {
-    console.log(`${NEWZNAB_LOG_PREFIX}[DEBUG] ${message}`);
-  }
-}
-
-
-
-function parseAllowedResolutionList(rawValue) {
-  const entries = parseCommaList(rawValue);
-  if (!Array.isArray(entries) || entries.length === 0) return [];
-  return entries
-    .map((entry) => normalizeResolutionToken(entry))
-    .filter(Boolean);
-}
-
-function parseResolutionLimitValue(rawValue) {
-  if (rawValue === undefined || rawValue === null) return null;
-  const normalized = String(rawValue).trim();
-  if (!normalized) return null;
-  const numeric = Number(normalized);
-  if (!Number.isFinite(numeric) || numeric <= 0) return null;
-  return Math.floor(numeric);
-}
-
 function refreshPaidIndexerTokens() {
   const paidTokens = new Set();
   (TRIAGE_PRIORITY_INDEXERS || []).forEach((token) => {
@@ -690,163 +542,6 @@ function refreshPaidIndexerTokens() {
     if (token) paidTokens.add(token);
   });
   PAID_INDEXER_TOKENS = paidTokens;
-}
-
-function isResultFromPaidIndexer(result) {
-  if (!result || PAID_INDEXER_TOKENS.size === 0) return false;
-  const tokens = [
-    normalizeIndexerToken(result.indexerId || result.IndexerId),
-    normalizeIndexerToken(result.indexer || result.Indexer),
-  ].filter(Boolean);
-  if (tokens.length === 0) return false;
-  return tokens.some((token) => PAID_INDEXER_TOKENS.has(token));
-}
-
-function normalizeUsenetGroup(value) {
-  if (!value) return '';
-  return String(value).trim().toLowerCase();
-}
-
-function extractUsenetGroup(result) {
-  if (!result || typeof result !== 'object') return '';
-  return normalizeUsenetGroup(
-    result.group
-    || result.groups
-    || result.usenetGroup
-    || result?.release?.group
-  );
-}
-
-function extractFileCount(result) {
-  if (!result || typeof result !== 'object') return Number.POSITIVE_INFINITY;
-  const raw = result.files ?? result.filecount ?? result.fileCount;
-  const parsed = Number(raw);
-  if (Number.isFinite(parsed) && parsed > 0) return parsed;
-  return Number.POSITIVE_INFINITY;
-}
-
-function dedupeResultsByTitle(results) {
-  if (!Array.isArray(results) || results.length === 0) return [];
-  const buckets = new Map();
-  const deduped = [];
-  for (const result of results) {
-    if (!result || typeof result !== 'object') continue;
-    const normalizedTitle = normalizeReleaseTitle(result.title);
-    const publishMeta = getPublishMetadataFromResult(result);
-    if (publishMeta.publishDateMs && !result.publishDateMs) {
-      result.publishDateMs = publishMeta.publishDateMs;
-    }
-    if (publishMeta.publishDateIso && !result.publishDateIso) {
-      result.publishDateIso = publishMeta.publishDateIso;
-    }
-    if ((publishMeta.ageDays ?? null) !== null && (result.ageDays === undefined || result.ageDays === null)) {
-      result.ageDays = publishMeta.ageDays;
-    }
-    if (!normalizedTitle) {
-      deduped.push(result);
-      continue;
-    }
-    const usenetGroup = extractUsenetGroup(result);
-    if (!usenetGroup) {
-      // Require a group token for safe duplicate collapsing across indexers.
-      deduped.push(result);
-      continue;
-    }
-
-    const bucketKey = `${normalizedTitle}|${usenetGroup}`;
-    let bucket = buckets.get(bucketKey);
-    if (!bucket) {
-      bucket = [];
-      buckets.set(bucketKey, bucket);
-    }
-    const candidatePublish = publishMeta.publishDateMs ?? null;
-    const candidateIsPaid = isResultFromPaidIndexer(result);
-    const candidateFiles = extractFileCount(result);
-    let matchedEntry = null;
-    for (const entry of bucket) {
-      if (areReleasesWithinDays(entry.publishDateMs ?? null, candidatePublish ?? null, DEDUPE_MAX_PUBLISH_DIFF_DAYS)) {
-        matchedEntry = entry;
-        break;
-      }
-    }
-    if (!matchedEntry) {
-      const entry = {
-        publishDateMs: candidatePublish,
-        isPaid: candidateIsPaid,
-        fileCount: candidateFiles,
-        result,
-        listIndex: deduped.length,
-      };
-      bucket.push(entry);
-      deduped.push(result);
-      continue;
-    }
-
-    if (candidateIsPaid && !matchedEntry.isPaid) {
-      matchedEntry.isPaid = true;
-      matchedEntry.fileCount = candidateFiles;
-      matchedEntry.result = result;
-      deduped[matchedEntry.listIndex] = result;
-      continue;
-    }
-
-    if (candidateIsPaid === matchedEntry.isPaid) {
-      const existingFiles = Number.isFinite(matchedEntry.fileCount) ? matchedEntry.fileCount : Number.POSITIVE_INFINITY;
-      if (candidateFiles < existingFiles) {
-        matchedEntry.fileCount = candidateFiles;
-        matchedEntry.result = result;
-        deduped[matchedEntry.listIndex] = result;
-      }
-      continue;
-    }
-    // If we reach here, existing is paid and candidate is not — skip candidate
-  }
-  return deduped;
-}
-
-function buildTriageNntpConfig() {
-  const host = (process.env.NZB_TRIAGE_NNTP_HOST || '').trim();
-  if (!host) return null;
-  return {
-    host,
-    port: toPositiveInt(process.env.NZB_TRIAGE_NNTP_PORT, 119),
-    user: (process.env.NZB_TRIAGE_NNTP_USER || '').trim() || undefined,
-    pass: (process.env.NZB_TRIAGE_NNTP_PASS || '').trim() || undefined,
-    useTLS: toBoolean(process.env.NZB_TRIAGE_NNTP_TLS, false),
-  };
-}
-
-/**
- * Build NNTP servers array for native Stremio v5 streaming.
- * Format: nntps://{user}:{pass}@{host}:{port}/{connections}
- * or nntp:// for non-TLS connections
- */
-function buildNntpServersArray() {
-  const host = (process.env.NZB_TRIAGE_NNTP_HOST || '').trim();
-  if (!host) return [];
-
-  const port = toPositiveInt(process.env.NZB_TRIAGE_NNTP_PORT, 119);
-  const user = (process.env.NZB_TRIAGE_NNTP_USER || '').trim();
-  const pass = (process.env.NZB_TRIAGE_NNTP_PASS || '').trim();
-  const useTLS = toBoolean(process.env.NZB_TRIAGE_NNTP_TLS, false);
-  const connections = toPositiveInt(process.env.NZB_TRIAGE_NNTP_MAX_CONNECTIONS, 12);
-
-  const protocol = useTLS ? 'nntps' : 'nntp';
-  const auth = user && pass ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@` : '';
-  const serverUrl = `${protocol}://${auth}${host}:${port}/${connections}`;
-
-  return [serverUrl];
-}
-
-// Backward compat: derive sort order from legacy NZB_SORT_MODE when NZB_SORT_ORDER is not explicitly set
-function deriveSortOrder(rawSortOrder, sortMode) {
-  const explicit = (rawSortOrder || '').trim();
-  if (explicit) return parseCommaList(explicit);
-  switch (sortMode) {
-    case 'language_quality_size': return ['language', 'resolution', 'size'];
-    case 'quality_then_size':    return ['resolution', 'size', 'files'];
-    default:                     return ['resolution', 'size', 'files'];
-  }
 }
 
 let INDEXER_SORT_MODE = normalizeSortMode(process.env.NZB_SORT_MODE, 'quality_then_size');
@@ -1270,38 +965,6 @@ const ADMIN_CONFIG_KEYS = [
 
 ADMIN_CONFIG_KEYS.push('NEWZNAB_ENABLED', 'NEWZNAB_FILTER_NZB_ONLY', ...NEWZNAB_NUMBERED_KEYS);
 
-function extractTriageOverrides(query) {
-  if (!query || typeof query !== 'object') return {};
-  const sizeCandidate = query.maxSizeGb ?? query.max_size_gb ?? query.triageSizeGb ?? query.triage_size_gb ?? query.preferredSizeGb;
-  const sizeGb = toFiniteNumber(sizeCandidate, null);
-  const maxSizeBytes = Number.isFinite(sizeGb) && sizeGb > 0 ? sizeGb * 1024 * 1024 * 1024 : null;
-  let indexerSource = null;
-  if (typeof query.triageIndexerIds === 'string') indexerSource = query.triageIndexerIds;
-  else if (Array.isArray(query.triageIndexerIds)) indexerSource = query.triageIndexerIds.join(',');
-  const indexers = indexerSource ? parseCommaList(indexerSource) : null;
-  const disabled = query.triageDisabled !== undefined ? toBoolean(query.triageDisabled, true) : null;
-  const enabled = query.triageEnabled !== undefined ? toBoolean(query.triageEnabled, false) : null;
-  const sortMode = typeof query.sortMode === 'string' ? query.sortMode : query.nzbSortMode;
-  const preferredLanguageInput = query.preferredLanguages ?? query.preferredLanguage ?? query.language ?? query.lang;
-  let dedupeOverride = null;
-  if (query.dedupe !== undefined) {
-    dedupeOverride = toBoolean(query.dedupe, true);
-  } else if (query.dedupeEnabled !== undefined) {
-    dedupeOverride = toBoolean(query.dedupeEnabled, true);
-  } else if (query.dedupeDisabled !== undefined) {
-    dedupeOverride = !toBoolean(query.dedupeDisabled, false);
-  }
-  return {
-    maxSizeBytes,
-    indexers,
-    disabled,
-    enabled,
-    sortMode: typeof sortMode === 'string' ? sortMode : null,
-    preferredLanguages: typeof preferredLanguageInput === 'string' ? preferredLanguageInput : null,
-    dedupeEnabled: dedupeOverride,
-  };
-}
-
 function executeManagerPlanWithBackoff(plan) {
   if (INDEXER_MANAGER === 'none') {
     return Promise.resolve({ results: [] });
@@ -1414,74 +1077,6 @@ const CINEMETA_URL = 'https://v3-cinemeta.strem.io/meta';
 const pipelineAsync = promisify(pipeline);
 const posixPath = path.posix;
 
-// ---------------------------------------------------------------------------
-// AES-256-GCM encryption for stream URL parameters
-// Prevents stream-token holders from extracting embedded API keys / credentials.
-// The key is auto-generated on first use and persisted in runtime-env.json.
-// ---------------------------------------------------------------------------
-const STREAM_PARAMS_ALGO = 'aes-256-gcm';
-const STREAM_PARAMS_KEY_ENV = 'STREAM_PARAMS_ENCRYPTION_KEY';
-let _streamParamsKey = null;
-
-function getStreamParamsKey() {
-  if (_streamParamsKey) return _streamParamsKey;
-  const hexKey = (process.env[STREAM_PARAMS_KEY_ENV] || '').trim();
-  if (hexKey && /^[0-9a-f]{64}$/i.test(hexKey)) {
-    _streamParamsKey = Buffer.from(hexKey, 'hex');
-    return _streamParamsKey;
-  }
-  // Generate a new random 256-bit key and persist it
-  const newKey = crypto.randomBytes(32);
-  runtimeEnv.updateRuntimeEnv({ [STREAM_PARAMS_KEY_ENV]: newKey.toString('hex') });
-  runtimeEnv.applyRuntimeEnv();
-  _streamParamsKey = newKey;
-  console.log('[SECURITY] Generated new stream-params encryption key');
-  return _streamParamsKey;
-}
-
-/**
- * Encrypt stream parameters so embedded download URLs / API keys are opaque.
- * Format: "e1.{iv_hex}.{ciphertext+authTag_base64url}"
- */
-function encodeStreamParams(params) {
-  const json = JSON.stringify(Object.fromEntries(params.entries()));
-  const key = getStreamParamsKey();
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv(STREAM_PARAMS_ALGO, key, iv);
-  const encrypted = Buffer.concat([cipher.update(json, 'utf8'), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-  const payload = Buffer.concat([encrypted, authTag]).toString('base64url');
-  return `e1.${iv.toString('hex')}.${payload}`;
-}
-
-/**
- * Decrypt stream parameters. Falls back to legacy base64url for backward
- * compatibility with URLs cached before encryption was enabled.
- */
-function decodeStreamParams(encoded) {
-  try {
-    if (encoded.startsWith('e1.')) {
-      const parts = encoded.split('.');
-      if (parts.length !== 3) return null;
-      const iv = Buffer.from(parts[1], 'hex');
-      const combined = Buffer.from(parts[2], 'base64url');
-      if (combined.length < 16) return null;
-      const authTag = combined.subarray(combined.length - 16);
-      const ciphertext = combined.subarray(0, combined.length - 16);
-      const key = getStreamParamsKey();
-      const decipher = crypto.createDecipheriv(STREAM_PARAMS_ALGO, key, iv);
-      decipher.setAuthTag(authTag);
-      const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-      return JSON.parse(decrypted.toString('utf8'));
-    }
-    // Legacy base64url fallback removed for security — only encrypted params accepted
-    console.warn('[SECURITY] Rejected unencrypted (legacy) stream params. Re-search to get updated encrypted URLs.');
-    return null;
-  } catch (_) {
-    return null;
-  }
-}
-
 // Eagerly initialize the stream-params encryption key so it appears in
 // runtime-env.json immediately on first startup (not deferred to first request).
 getStreamParamsKey();
@@ -1490,6 +1085,12 @@ getStreamParamsKey();
 // Auto-generate ADDON_STREAM_TOKEN if not explicitly set.
 // Since v1.7.6 the stream token is always independent from the admin secret.
 // ---------------------------------------------------------------------------
+function ensureAddonConfigured() {
+  if (!ADDON_BASE_URL) {
+    throw new Error('ADDON_BASE_URL is not configured');
+  }
+}
+
 function ensureStreamTokenExists() {
   const existing = (process.env.ADDON_STREAM_TOKEN || '').trim();
   if (existing) return;
@@ -1500,32 +1101,6 @@ function ensureStreamTokenExists() {
   console.log('[SECURITY] ⚠ Since v1.7.6, the stream token is always separate from the admin token.');
   console.log('[SECURITY] ⚠ Your manifest URL has changed - you may need to reinstall the addon in Stremio.');
   console.log(`[SECURITY] ⚠ New stream token generated (${generated.slice(0, 4)}…). Check runtime-env.json or the admin panel to see the full token.`);
-}
-
-function buildStreamCacheKey({ type, id, query = {}, requestedEpisode = null }) {
-  const normalizedQuery = {};
-  Object.keys(query)
-    .sort()
-    .forEach((key) => {
-      normalizedQuery[key] = query[key];
-    });
-  const normalizedEpisode = requestedEpisode
-    ? {
-      season: Number.isFinite(requestedEpisode.season) ? requestedEpisode.season : null,
-      episode: Number.isFinite(requestedEpisode.episode) ? requestedEpisode.episode : null,
-    }
-    : null;
-  return JSON.stringify({ type, id, requestedEpisode: normalizedEpisode, query: normalizedQuery });
-}
-
-function restoreTriageDecisions(snapshot) {
-  const map = new Map();
-  if (!Array.isArray(snapshot)) return map;
-  snapshot.forEach(([downloadUrl, decision]) => {
-    if (!downloadUrl || !decision) return;
-    map.set(downloadUrl, { ...decision });
-  });
-  return map;
 }
 
 const NZBDAV_VIDEO_EXTENSIONS = new Set([
@@ -1558,236 +1133,30 @@ const VIDEO_MIME_MAP = new Map([
   ['.mpeg', 'video/mpeg']
 ]);
 
-function sanitizeStrictSearchPhrase(text) {
-  if (!text) return '';
-  return text
-    .replace(/&/g, ' and ')
-    .replace(/[\.\-_:\s]+/g, ' ')
-    .replace(/[^\w\sÀ-ÿ]/g, '')
-    .toLowerCase()
-    .trim();
+// Route handlers created from extracted factory modules
+function getRouteConfig() {
+  return {
+    STREAMING_MODE,
+    ADDON_NAME,
+    DEFAULT_ADDON_NAME,
+    ADDON_BASE_URL,
+    ADDON_VERSION,
+    NZBDAV_HISTORY_CATALOG_LIMIT,
+  };
 }
 
-function matchesStrictSearch(title, strictPhrase) {
-  if (!strictPhrase) return true;
-  const candidate = sanitizeStrictSearchPhrase(title);
-  if (!candidate) return false;
-  if (candidate === strictPhrase) return true;
-  const candidateTokens = candidate.split(' ').filter(Boolean);
-  const phraseTokens = strictPhrase.split(' ').filter(Boolean);
-  if (phraseTokens.length === 0) return true;
-
-  // Nothing before first query token, nothing after last query token, gaps allowed in between
-  if (candidateTokens[0] !== phraseTokens[0]) return false;
-  if (candidateTokens[candidateTokens.length - 1] !== phraseTokens[phraseTokens.length - 1]) return false;
-  // Remaining tokens must appear in order, gaps allowed
-  let candidateIdx = 1;
-  for (let i = 1; i < phraseTokens.length; i += 1) {
-    const token = phraseTokens[i];
-    let found = false;
-    while (candidateIdx < candidateTokens.length) {
-      if (candidateTokens[candidateIdx] === token) {
-        found = true;
-        candidateIdx += 1;
-        break;
-      }
-      candidateIdx += 1;
-    }
-    if (!found) return false;
-  }
-  return true;
-}
-
-// --- Levenshtein-based title similarity (catches false positives like "The Kingdom" vs "The Last Kingdom") ---
-
-const TITLE_SIMILARITY_THRESHOLD = 0.85;
-
-function normaliseTitle(text) {
-  if (!text) return '';
-  return text
-    .replace(/&/g, 'and')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')   // strip diacritics
-    .replace(/[^\p{L}\p{N}]/gu, '')   // strip ALL non-alphanumeric (spaces, punctuation, articles collapse together)
-    .toLowerCase();
-}
-
-function levenshteinDistance(a, b) {
-  const m = a.length;
-  const n = b.length;
-  if (m === 0) return n;
-  if (n === 0) return m;
-
-  // Single-row DP
-  let prev = new Array(n + 1);
-  let curr = new Array(n + 1);
-  for (let j = 0; j <= n; j++) prev[j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    curr[0] = i;
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      curr[j] = Math.min(
-        prev[j] + 1,      // deletion
-        curr[j - 1] + 1,  // insertion
-        prev[j - 1] + cost // substitution
-      );
-    }
-    [prev, curr] = [curr, prev];
-  }
-  return prev[n];
-}
-
-function levenshteinRatio(a, b) {
-  const maxLen = Math.max(a.length, b.length);
-  if (maxLen === 0) return 1;
-  return 1 - levenshteinDistance(a, b) / maxLen;
-}
-
-function titleSimilarityCheck(candidateParsedTitle, queryParsedTitle) {
-  if (!candidateParsedTitle || !queryParsedTitle) return true; // skip if either missing
-  const normCandidate = normaliseTitle(candidateParsedTitle);
-  const normQuery = normaliseTitle(queryParsedTitle);
-  if (!normCandidate || !normQuery) return true;
-  if (normCandidate === normQuery) return true;
-  return levenshteinRatio(normCandidate, normQuery) >= TITLE_SIMILARITY_THRESHOLD;
-}
-
-function ensureAddonConfigured() {
-  if (!ADDON_BASE_URL) {
-    throw new Error('ADDON_BASE_URL is not configured');
-  }
-}
-
-// Manifest endpoint
-function manifestHandler(req, res) {
-  ensureAddonConfigured();
-
-  const description = STREAMING_MODE === 'native'
-    ? 'Native Usenet streaming for Stremio v5 (Windows) - NZB sources via direct Newznab indexers'
-    : 'Usenet-powered instant streams for Stremio via Prowlarr/NZBHydra and NZBDav';
-
-  const catalogs = [];
-  const resources = ['stream'];
-  const idPrefixes = ['tt', 'tvdb', 'tmdb', 'kitsu', 'mal', 'anilist', 'pt', specialMetadata.SPECIAL_ID_PREFIX];
-  if (STREAMING_MODE !== 'native' && NZBDAV_HISTORY_CATALOG_LIMIT > 0) {
-    const catalogName = ADDON_NAME || DEFAULT_ADDON_NAME;
-    catalogs.push(
-      { type: 'movie', id: 'nzbdav_completed', name: catalogName, pageSize: 20, extra: [{ name: 'skip' }] },
-      { type: 'series', id: 'nzbdav_completed', name: catalogName, pageSize: 20, extra: [{ name: 'skip' }] }
-    );
-    resources.push('catalog', 'meta');
-    idPrefixes.push('nzbdav');
-  }
-
-  res.json({
-    id: STREAMING_MODE === 'native' ? 'com.usenet.streamer.native' : 'com.usenet.streamer',
-    version: ADDON_VERSION,
-    name: ADDON_NAME,
-    description,
-    logo: `${ADDON_BASE_URL.replace(/\/$/, '')}/assets/icon.png`,
-    resources,
-    types: ['movie', 'series', 'channel', 'tv'],
-    catalogs,
-    idPrefixes
-  });
-}
+const manifestHandler = createManifestHandler(getRouteConfig);
+const catalogHandler = createCatalogHandler(getRouteConfig);
+const metaHandler = createMetaHandler(getRouteConfig);
+const handleEasynewsNzbDownload = createEasynewsHandler(getRouteConfig);
 
 ['/manifest.json', '/:token/manifest.json'].forEach((route) => {
   app.get(route, manifestHandler);
 });
 
-async function catalogHandler(req, res) {
-  if (STREAMING_MODE === 'native' || NZBDAV_HISTORY_CATALOG_LIMIT <= 0) {
-    res.status(404).json({ metas: [] });
-    return;
-  }
-
-  const { type, id } = req.params;
-  if (id !== 'nzbdav_completed') {
-    res.status(404).json({ metas: [] });
-    return;
-  }
-
-  try {
-    nzbdavService.ensureNzbdavConfigured();
-  } catch (error) {
-    res.status(500).json({ metas: [], error: sanitizeErrorForClient(error) });
-    return;
-  }
-
-  const skip = Math.max(0, parseInt(req.query.skip || '0', 10) || 0);
-  const limit = Math.max(0, Math.min(200, NZBDAV_HISTORY_CATALOG_LIMIT));
-  if (limit === 0) {
-    res.json({ metas: [] });
-    return;
-  }
-
-  const categoryForType = nzbdavService.getNzbdavCategory(type);
-  const historyMap = await nzbdavService.fetchCompletedNzbdavHistory([categoryForType], limit + skip);
-  const entries = Array.from(historyMap.values());
-  const slice = entries.slice(skip, skip + limit);
-  const poster = `${ADDON_BASE_URL.replace(/\/$/, '')}/assets/icon.png`;
-
-  const metas = slice.map((entry) => {
-    const name = entry.jobName || 'NZBDav Completed';
-    return {
-      id: `nzbdav:${entry.nzoId}`,
-      type,
-      name,
-      poster,
-    };
-  });
-
-  res.json({ metas });
-}
-
 ['/catalog/:type/:id.json', '/:token/catalog/:type/:id.json'].forEach((route) => {
   app.get(route, catalogHandler);
 });
-
-async function metaHandler(req, res) {
-  if (STREAMING_MODE === 'native' || NZBDAV_HISTORY_CATALOG_LIMIT <= 0) {
-    res.status(404).json({ meta: null });
-    return;
-  }
-  const { type, id } = req.params;
-  if (!id || !id.startsWith('nzbdav:')) {
-    res.status(404).json({ meta: null });
-    return;
-  }
-
-  try {
-    nzbdavService.ensureNzbdavConfigured();
-  } catch (error) {
-    res.status(500).json({ meta: null, error: sanitizeErrorForClient(error) });
-    return;
-  }
-
-  const nzoId = id.slice('nzbdav:'.length).trim();
-  if (!nzoId) {
-    res.status(404).json({ meta: null });
-    return;
-  }
-
-  const categoryForType = nzbdavService.getNzbdavCategory(type);
-  const historyMap = await nzbdavService.fetchCompletedNzbdavHistory([categoryForType], Math.max(50, NZBDAV_HISTORY_CATALOG_LIMIT));
-  const match = Array.from(historyMap.values()).find((entry) => String(entry.nzoId) === String(nzoId));
-  if (!match) {
-    res.status(404).json({ meta: null });
-    return;
-  }
-
-  const poster = `${ADDON_BASE_URL.replace(/\/$/, '')}/assets/icon.png`;
-  res.json({
-    meta: {
-      id: `nzbdav:${match.nzoId}`,
-      type,
-      name: match.jobName || 'NZBDav Completed',
-      poster,
-    }
-  });
-}
 
 ['/meta/:type/:id.json', '/:token/meta/:type/:id.json'].forEach((route) => {
   app.get(route, metaHandler);
@@ -2088,7 +1457,7 @@ async function streamHandler(req, res) {
     if (cachedSearchMeta) {
       const restored = restoreFinalNzbResults(cachedSearchMeta.finalNzbResults);
       rawSearchResults = restored.slice();
-      dedupedSearchResults = dedupeResultsByTitle(restored);
+      dedupedSearchResults = dedupeResultsByTitle(restored, PAID_INDEXER_TOKENS);
       finalNzbResults = dedupedSearchResults.slice();
       usingCachedSearchResults = true;
     }
@@ -3245,7 +2614,8 @@ async function streamHandler(req, res) {
       const dedupedNzbResults = dedupeResultsByTitle(
         usingStrictIdMatching
           ? aggregatedResults.map((entry) => entry.result)
-          : Array.from(resultsByKey.values()).map((entry) => entry.result)
+          : Array.from(resultsByKey.values()).map((entry) => entry.result),
+        PAID_INDEXER_TOKENS
       );
       const rawNzbResults = rawAggregatedResults.map((entry) => entry.result);
 
@@ -3337,7 +2707,7 @@ async function streamHandler(req, res) {
       resolutionLimitPerQuality: RESOLUTION_LIMIT_PER_QUALITY,
     });
     if (dedupeEnabled) {
-      finalNzbResults = dedupeResultsByTitle(finalNzbResults);
+      finalNzbResults = dedupeResultsByTitle(finalNzbResults, PAID_INDEXER_TOKENS);
     }
 
     if (triagePrewarmPromise) {
@@ -3375,7 +2745,7 @@ async function streamHandler(req, res) {
     const overrideIndexerTokens = (triageOverrides.indexers && triageOverrides.indexers.length > 0)
       ? triageOverrides.indexers
       : null;
-    const directPaidTokens = overrideIndexerTokens ? [] : getPaidDirectIndexerTokens();
+    const directPaidTokens = overrideIndexerTokens ? [] : getPaidDirectIndexerTokens(ACTIVE_NEWZNAB_CONFIGS);
     const managerHealthTokens = INDEXER_MANAGER === 'none'
       ? []
       : (TRIAGE_PRIORITY_INDEXERS.length > 0 ? TRIAGE_PRIORITY_INDEXERS : TRIAGE_HEALTH_INDEXERS);
@@ -4704,39 +4074,6 @@ async function streamHandler(req, res) {
 ['/:token/stream/:type/:id.json', '/stream/:type/:id.json'].forEach((route) => {
   app.get(route, streamHandler);
 });
-
-async function handleEasynewsNzbDownload(req, res) {
-  if (!easynewsService.isEasynewsEnabled()) {
-    res.status(503).json({ error: 'Easynews integration is disabled' });
-    return;
-  }
-  const payload = typeof req.query.payload === 'string' ? req.query.payload : null;
-  if (!payload) {
-    res.status(400).json({ error: 'Missing payload parameter' });
-    return;
-  }
-  try {
-    const requester = req.headers['x-forwarded-for'] || req.ip || req.connection?.remoteAddress || 'unknown';
-    console.log('[EASYNEWS] Incoming NZB request', {
-      requester,
-      payloadPreview: `${payload.slice(0, 16)}${payload.length > 16 ? '…' : ''}`,
-      streamingMode: STREAMING_MODE,
-    });
-    const nzbData = await easynewsService.downloadEasynewsNzb(payload);
-    console.log('[EASYNEWS] NZB download succeeded', {
-      fileName: nzbData.fileName,
-      size: nzbData.buffer?.length,
-      contentType: nzbData.contentType,
-    });
-    res.setHeader('Content-Type', nzbData.contentType || 'application/x-nzb+xml');
-    res.setHeader('Content-Disposition', `attachment; filename="${nzbData.fileName || 'easynews.nzb'}"`);
-    res.status(200).send(nzbData.buffer);
-  } catch (error) {
-    const statusCode = /credential|unauthorized|forbidden/i.test(error.message || '') ? 401 : 502;
-    console.warn('[EASYNEWS] NZB download failed', error.message || error);
-    res.status(statusCode).json({ error: sanitizeErrorForClient(error) || 'Unable to fetch Easynews NZB' });
-  }
-}
 
 // --- Smart Play endpoint ---
 // When user clicks Smart Play, wait for the first healthy NZB from the background triage session,
